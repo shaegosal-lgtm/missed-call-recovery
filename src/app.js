@@ -1,4 +1,5 @@
 require('dotenv').config();
+console.log('ENV CHECK - SID starts with:', process.env.TWILIO_ACCOUNT_SID?.substring(0, 4));
 const express = require('express');
 
 const twilioRoutes = require('./routes/twilio');
