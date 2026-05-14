@@ -65,5 +65,25 @@ router.patch('/:id/cancel', (req, res) => {
   const result = cancelAppointment(req.params.id);
   res.json(result);
 });
+// Temporary setup route — remove after use
+router.post('/setup-business', async (req, res) => {
+  const { v4: uuidv4 } = require('uuid');
+  const { name, ownerPhone, twilioNumber, timezone, durationMins } = req.body;
 
+  try {
+    const id = uuidv4();
+    db.prepare(`INSERT INTO businesses (id, name, owner_phone, timezone, appointment_duration_mins, twilio_number) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(id, name, ownerPhone, timezone || 'America/Toronto', durationMins || 60, twilioNumber);
+
+    const days = [1, 2, 3, 4, 5];
+    days.forEach(day => {
+      db.prepare(`INSERT INTO business_hours (id, business_id, day_of_week, open_time, close_time, is_open) VALUES (?, ?, ?, ?, ?, 1)`)
+        .run(uuidv4(), id, day, '09:00', '17:00');
+    });
+
+    res.json({ success: true, businessId: id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 module.exports = router;
