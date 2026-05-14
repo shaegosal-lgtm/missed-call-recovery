@@ -13,10 +13,16 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
 
   if (!CallStatus || CallStatus === 'ringing' || CallStatus === 'in-progress') {
-    return res.status(200).type('text/xml').send('<Response></Response>');
+    return res.status(200).type('text/xml').send(`
+      <Response>
+        <Say>Please hold while we connect your call.</Say>
+        <Pause length="20"/>
+        <Hangup/>
+      </Response>
+    `);
   }
 
-  if (CallStatus === 'no-answer' || CallStatus === 'busy' || CallStatus === 'failed') {
+  if (CallStatus === 'no-answer' || CallStatus === 'busy' || CallStatus === 'failed' || CallStatus === 'completed') {
     try {
       const callId = uuidv4();
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
