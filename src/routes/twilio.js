@@ -12,26 +12,27 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
 
-  // Only process the final status, not intermediate ones
-  if (CallStatus !== 'no-answer' && CallStatus !== 'busy' && CallStatus !== 'failed') {
-    return res.status(200).type('text/xml').send('<Response><Reject/></Response>');
+  if (!CallStatus || CallStatus === 'ringing' || CallStatus === 'in-progress') {
+    return res.status(200).type('text/xml').send('<Response></Response>');
   }
 
-  try {
-    const callId = uuidv4();
-    db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
-      .run(callId, From, To, CallSid, 'missed');
+  if (CallStatus === 'no-answer' || CallStatus === 'busy' || CallStatus === 'failed') {
+    try {
+      const callId = uuidv4();
+      db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
+        .run(callId, From, To, CallSid, 'missed');
 
-    createLead(From, callId);
+      createLead(From, callId);
 
-    await sendSMS(From,
-      `Hi! You just called us and we missed you. We're sorry about that! ` +
-      `Can you tell us your name so we can follow up properly?`
-    );
+      await sendSMS(From,
+        `Hi! You just called us and we missed you. We're sorry about that! ` +
+        `Can you tell us your name so we can follow up properly?`
+      );
 
-    console.log(`SMS sent to ${From}`);
-  } catch (err) {
-    console.log(`Duplicate or error: ${err.message}`);
+      console.log(`SMS sent to ${From}`);
+    } catch (err) {
+      console.log(`Duplicate or error: ${err.message}`);
+    }
   }
 
   res.status(200).type('text/xml').send('<Response></Response>');
