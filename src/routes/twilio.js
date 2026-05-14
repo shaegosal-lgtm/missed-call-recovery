@@ -163,7 +163,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     // Check if message looks like a booking/time request
-    if (looksLikeBooking(text)) {
+    if (looksLikeBooking(text)) {console.log('Looking for business with number:', process.env.TWILIO_PHONE_NUMBER);
       const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?')
         .get(process.env.TWILIO_PHONE_NUMBER);
 
