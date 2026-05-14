@@ -9,21 +9,13 @@ const { notifyOwner } = require('../services/notifyService');
 const twilioAuth = require('../middleware/twilioAuth');
 
 router.post('/missed-call', twilioAuth, async (req, res) => {
-  const { From, To, CallSid } = req.body;
-  console.log(`Incoming call from ${From}, CallSid: ${CallSid}`);
+  const { From, To, CallSid, CallStatus } = req.body;
+  console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
 
-  // Respond with TwiML — ring for 20 seconds with no answer, then go to /no-answer
-  res.status(200).type('text/xml').send(`
-    <Response>
-      <Pause length="20"/>
-      <Redirect>/webhooks/twilio/no-answer</Redirect>
-    </Response>
-  `);
-});
-
-router.post('/no-answer', twilioAuth, async (req, res) => {
-  const { From, To, CallSid } = req.body;
-  console.log(`No answer for call from ${From}, CallSid: ${CallSid}`);
+  // Only process the final status, not intermediate ones
+  if (CallStatus !== 'no-answer' && CallStatus !== 'busy' && CallStatus !== 'failed') {
+    return res.status(200).type('text/xml').send('<Response><Reject/></Response>');
+  }
 
   try {
     const callId = uuidv4();
@@ -42,7 +34,7 @@ router.post('/no-answer', twilioAuth, async (req, res) => {
     console.log(`Duplicate or error: ${err.message}`);
   }
 
-  res.status(200).type('text/xml').send(`<Response><Hangup/></Response>`);
+  res.status(200).type('text/xml').send('<Response></Response>');
 });
 
 router.post('/sms-reply', twilioAuth, async (req, res) => {
