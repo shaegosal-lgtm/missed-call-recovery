@@ -26,6 +26,48 @@ db.exec(`
     conversation TEXT DEFAULT '[]',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS businesses (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT,
+    owner_phone TEXT NOT NULL,
+    timezone TEXT DEFAULT 'America/Toronto',
+    appointment_duration_mins INTEGER DEFAULT 60,
+    twilio_number TEXT UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS business_hours (
+    id TEXT PRIMARY KEY,
+    business_id TEXT REFERENCES businesses(id),
+    day_of_week INTEGER NOT NULL,
+    open_time TEXT NOT NULL,
+    close_time TEXT NOT NULL,
+    is_open INTEGER DEFAULT 1
+  );
+
+  CREATE TABLE IF NOT EXISTS appointments (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT REFERENCES leads(id),
+    business_id TEXT REFERENCES businesses(id),
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    status TEXT DEFAULT 'scheduled',
+    service_type TEXT,
+    notes TEXT,
+    confirmation_code TEXT UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS blocked_times (
+    id TEXT PRIMARY KEY,
+    business_id TEXT REFERENCES businesses(id),
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    reason TEXT
+  );
 `);
 
 module.exports = db;

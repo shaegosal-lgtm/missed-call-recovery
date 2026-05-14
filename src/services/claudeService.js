@@ -30,4 +30,35 @@ Urgency guide: high = pain/emergency/urgent, medium = wants appointment soon, lo
   }
 }
 
-module.exports = { classifyLead };
+async function detectBookingIntent(message, conversationHistory) {
+  const prompt = `You are an AI assistant for an appointment-based business handling SMS conversations.
+
+Analyze this customer message and conversation history to determine intent and extract details.
+
+Customer message: "${message}"
+Recent conversation: ${JSON.stringify(conversationHistory.slice(-4))}
+
+Respond ONLY with valid JSON in this exact format:
+{
+  "intent": "book" | "reschedule" | "cancel" | "check_availability" | "confirm" | "decline" | "other",
+  "preferred_date": "YYYY-MM-DD or null",
+  "preferred_time": "HH:MM in 24hr format or null",
+  "time_preference": "morning" | "afternoon" | "evening" | null,
+  "selected_slot_index": "0-based index if customer picked from a list, otherwise null",
+  "confidence": "high" | "medium" | "low"
+}`;
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  try {
+    return JSON.parse(response.content[0].text);
+  } catch {
+    return { intent: 'other', confidence: 'low' };
+  }
+}
+
+module.exports = { classifyLead, detectBookingIntent };
