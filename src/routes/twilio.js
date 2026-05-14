@@ -16,6 +16,17 @@ const {
   formatDate,
 } = require('../services/schedulingService');
 
+function looksLikeBooking(text) {
+  const t = text.toLowerCase();
+  const timeWords = [
+    'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
+    'tomorrow','today','next week','morning','afternoon','evening','night',
+    'am','pm','book','schedule','appointment','come in','visit','available',
+    'monday','tuesday','anytime','soon','asap','weekend'
+  ];
+  return timeWords.some(w => t.includes(w));
+}
+
 router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
@@ -92,26 +103,81 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       .catch(err => console.error('Claude classification failed:', err));
 
   } else {
-    // Lead is fully qualified — handle scheduling
     const convo = JSON.parse(lead.conversation || '[]');
-    let intent;
+    const upperText = text.toUpperCase();
 
-    try {
-      intent = await detectBookingIntent(text, convo);
-    } catch (err) {
-      console.error('Intent detection failed:', err);
-      intent = { intent: 'other', confidence: 'low' };
+    // Handle CANCEL keyword directly
+    if (upperText === 'CANCEL') {
+      const appt = getAppointmentByPhone(From);
+      if (!appt) {
+        await sendSMS(From, `We don't have an active appointment on file for your number.`);
+      } else {
+        cancelAppointment(appt.id);
+        await sendSMS(From, `Your appointment has been cancelled. Text us anytime to rebook.`);
+      }
+      return res.status(200).send('<Response></Response>');
     }
 
-    console.log(`Intent detected: ${intent.intent} (${intent.confidence})`);
+    // Handle slot selection (1, 2, or 3)
+    if (/^[123]$/.test(text.trim())) {
+      const recentSystem = [...convo].reverse().find(m => m.role === 'system');
 
-    if (intent.intent === 'book' || intent.intent === 'check_availability') {
+      if (!recentSystem) {
+        await sendSMS(From, `Would you like to book an appointment? Let us know what day works for you.`);
+        return res.status(200).send('<Response></Response>');
+      }
+
+      let pendingData;
+      try {
+        pendingData = JSON.parse(recentSystem.body);
+      } catch {
+        await sendSMS(From, `Something went wrong. Please tell us what day you'd like to come in.`);
+        return res.status(200).send('<Response></Response>');
+      }
+
+      const { pendingSlots, businessId } = pendingData;
+      const index = parseInt(text.trim()) - 1;
+      const chosen = pendingSlots[index];
+
+      if (!chosen) {
+        await sendSMS(From, `Please reply with 1, 2, or 3 to select a time.`);
+        return res.status(200).send('<Response></Response>');
+      }
+
+      const result = bookAppointment(businessId, lead.id, chosen.start);
+
+      if (!result.success) {
+        await sendSMS(From, `Sorry, that slot was just taken. What other day works for you?`);
+      } else {
+        await sendSMS(From,
+          `You're booked! Appointment confirmed for ${chosen.label}. ` +
+          `Your confirmation code is ${result.confirmationCode}. ` +
+          `Reply CANCEL anytime to cancel.`
+        );
+        await notifyOwner({
+          ...lead,
+          ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
+        });
+      }
+      return res.status(200).send('<Response></Response>');
+    }
+
+    // Check if message looks like a booking/time request
+    if (looksLikeBooking(text)) {
       const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?')
         .get(process.env.TWILIO_PHONE_NUMBER);
 
       if (!business) {
         await sendSMS(From, `A team member will reach out shortly to schedule your appointment.`);
         return res.status(200).send('<Response></Response>');
+      }
+
+      // Use Claude to extract date/time preference
+      let intent = { intent: 'book', time_preference: null, preferred_date: null };
+      try {
+        intent = await detectBookingIntent(text, convo);
+      } catch (err) {
+        console.error('Intent detection failed:', err);
       }
 
       const today = new Date();
@@ -160,57 +226,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         await sendSMS(From, `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to book your spot.`);
       }
 
-    } else if (intent.intent === 'confirm' || /^[123]$/.test(text.trim())) {
-      const recentSystem = [...convo].reverse().find(m => m.role === 'system');
-
-      if (!recentSystem) {
-        await sendSMS(From, `Would you like to book an appointment? Let us know what day works for you.`);
-        return res.status(200).send('<Response></Response>');
-      }
-
-      let pendingData;
-      try {
-        pendingData = JSON.parse(recentSystem.body);
-      } catch {
-        await sendSMS(From, `Something went wrong. Please tell us what day you'd like to come in.`);
-        return res.status(200).send('<Response></Response>');
-      }
-
-      const { pendingSlots, businessId } = pendingData;
-      const index = parseInt(text.trim()) - 1;
-      const chosen = pendingSlots[index];
-
-      if (!chosen) {
-        await sendSMS(From, `Please reply with 1, 2, or 3 to select a time.`);
-        return res.status(200).send('<Response></Response>');
-      }
-
-      const result = bookAppointment(businessId, lead.id, chosen.start);
-
-      if (!result.success) {
-        await sendSMS(From, `Sorry, that slot was just taken. What other day works for you?`);
-      } else {
-        await sendSMS(From,
-          `You're booked! Appointment confirmed for ${chosen.label}. ` +
-          `Your confirmation code is ${result.confirmationCode}. ` +
-          `Reply CANCEL anytime to cancel.`
-        );
-        await notifyOwner({
-          ...lead,
-          ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
-        });
-      }
-
-    } else if (text.toUpperCase() === 'CANCEL') {
-      const appt = getAppointmentByPhone(From);
-      if (!appt) {
-        await sendSMS(From, `We don't have an active appointment on file for your number.`);
-      } else {
-        cancelAppointment(appt.id);
-        await sendSMS(From, `Your appointment has been cancelled. Text us anytime to rebook.`);
-      }
-
-    } else if (intent.intent === 'reschedule') {
+    } else if (text.toLowerCase().includes('reschedule')) {
       const appt = getAppointmentByPhone(From);
       if (!appt) {
         await sendSMS(From, `We don't see an active appointment. Would you like to book one?`);
@@ -220,7 +236,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       }
 
     } else {
-      await sendSMS(From, `Thanks! Would you like to book an appointment? Just let us know what day works for you.`);
+      await sendSMS(From, `Would you like to book an appointment? Just let us know what day works for you.`);
     }
   }
 
