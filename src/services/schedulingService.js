@@ -1,18 +1,39 @@
 const db = require('../db/db');
 const { v4: uuidv4 } = require('uuid');
 
+function getLocalHour(date, timezone) {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      hour12: false,
+    });
+    return parseInt(formatter.format(date));
+  } catch {
+    return date.getHours();
+  }
+}
+
 function getAvailableSlots(businessId, date) {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(businessId);
   if (!business) throw new Error('Business not found');
 
   const duration = business.appointment_duration_mins;
-  const d = new Date(date);
-  const dayOfWeek = d.getDay();
+  const timezone = business.timezone || 'America/Toronto';
+
+  const d = new Date(date + 'T12:00:00');
+  const dayOfWeek = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+  }).format(d);
+
+  const dayMap = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
+  const dayNum = dayMap[dayOfWeek];
 
   const hours = db.prepare(`
     SELECT * FROM business_hours 
     WHERE business_id = ? AND day_of_week = ? AND is_open = 1
-  `).get(businessId, dayOfWeek);
+  `).get(businessId, dayNum);
 
   if (!hours) return [];
 
@@ -20,9 +41,9 @@ function getAvailableSlots(businessId, date) {
   const [openH, openM] = hours.open_time.split(':').map(Number);
   const [closeH, closeM] = hours.close_time.split(':').map(Number);
 
-  let current = new Date(date);
+  let current = new Date(date + 'T12:00:00');
   current.setHours(openH, openM, 0, 0);
-  const closing = new Date(date);
+  const closing = new Date(date + 'T12:00:00');
   closing.setHours(closeH, closeM, 0, 0);
 
   while (current < closing) {
@@ -32,6 +53,7 @@ function getAvailableSlots(businessId, date) {
         start: new Date(current),
         end: new Date(slotEnd),
         label: formatTime(current),
+        localHour: getLocalHour(current, timezone),
       });
     }
     current = new Date(current.getTime() + duration * 60000);

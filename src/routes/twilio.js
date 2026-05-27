@@ -216,11 +216,11 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       let slots = getAvailableSlots(business.id, targetDate);
 
       if (intent.time_preference === 'morning') {
-        slots = slots.filter(s => s.start.getHours() < 12);
+        slots = slots.filter(s => s.localHour < 12);
       } else if (intent.time_preference === 'afternoon') {
-        slots = slots.filter(s => s.start.getHours() >= 12 && s.start.getHours() < 17);
+        slots = slots.filter(s => s.localHour >= 12 && s.localHour < 17);
       } else if (intent.time_preference === 'evening') {
-        slots = slots.filter(s => s.start.getHours() >= 17);
+        slots = slots.filter(s => s.localHour >= 17);
       }
 
       if (slots.length === 0) {
