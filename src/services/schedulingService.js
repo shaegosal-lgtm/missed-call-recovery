@@ -1,39 +1,19 @@
 const db = require('../db/db');
 const { v4: uuidv4 } = require('uuid');
 
-function getLocalHour(date, timezone) {
-  try {
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      hour: 'numeric',
-      hour12: false,
-    });
-    return parseInt(formatter.format(date));
-  } catch {
-    return date.getHours();
-  }
-}
-
 function getAvailableSlots(businessId, date) {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(businessId);
   if (!business) throw new Error('Business not found');
 
   const duration = business.appointment_duration_mins;
-  const timezone = business.timezone || 'America/Toronto';
 
-  const d = new Date(date + 'T12:00:00');
-  const dayOfWeek = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    weekday: 'short',
-  }).format(d);
-
-  const dayMap = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
-  const dayNum = dayMap[dayOfWeek];
+  const d = new Date(date + 'T12:00:00Z');
+  const dayOfWeek = d.getUTCDay();
 
   const hours = db.prepare(`
     SELECT * FROM business_hours 
     WHERE business_id = ? AND day_of_week = ? AND is_open = 1
-  `).get(businessId, dayNum);
+  `).get(businessId, dayOfWeek);
 
   if (!hours) return [];
 
@@ -41,35 +21,49 @@ function getAvailableSlots(businessId, date) {
   const [openH, openM] = hours.open_time.split(':').map(Number);
   const [closeH, closeM] = hours.close_time.split(':').map(Number);
 
-  let current = new Date(date + 'T12:00:00');
-  current.setHours(openH, openM, 0, 0);
-  const closing = new Date(date + 'T12:00:00');
-  closing.setHours(closeH, closeM, 0, 0);
+  const openMinutes = openH * 60 + openM;
+  const closeMinutes = closeH * 60 + closeM;
 
-  while (current < closing) {
-    const slotEnd = new Date(current.getTime() + duration * 60000);
-    if (slotEnd <= closing) {
-      slots.push({
-        start: new Date(current),
-        end: new Date(slotEnd),
-        label: formatTime(current),
-        localHour: getLocalHour(current, timezone),
-      });
-    }
-    current = new Date(current.getTime() + duration * 60000);
+  let currentMinutes = openMinutes;
+  let slotIndex = 0;
+
+  while (currentMinutes + duration <= closeMinutes) {
+    const slotHour = Math.floor(currentMinutes / 60);
+    const slotMin = currentMinutes % 60;
+
+    const startDate = new Date(date + 'T12:00:00Z');
+    startDate.setUTCHours(openH + Math.floor((currentMinutes - openMinutes) / 60));
+    startDate.setUTCMinutes(openM + ((currentMinutes - openMinutes) % 60));
+    startDate.setUTCSeconds(0);
+    startDate.setUTCMilliseconds(0);
+
+    const endDate = new Date(startDate.getTime() + duration * 60000);
+
+    const label = formatHour(slotHour, slotMin);
+
+    slots.push({
+      start: startDate,
+      end: endDate,
+      label,
+      slotHour,
+      slotIndex,
+    });
+
+    currentMinutes += duration;
+    slotIndex++;
   }
 
   const bookedSlots = db.prepare(`
     SELECT start_time, end_time FROM appointments
     WHERE business_id = ? 
-    AND date(start_time) = date(?)
+    AND date(start_time) = ?
     AND status != 'cancelled'
   `).all(businessId, date);
 
   const blockedSlots = db.prepare(`
     SELECT start_time, end_time FROM blocked_times
     WHERE business_id = ?
-    AND date(start_time) = date(?)
+    AND date(start_time) = ?
   `).all(businessId, date);
 
   const unavailable = [...bookedSlots, ...blockedSlots];
@@ -181,12 +175,19 @@ function getAppointmentByPhone(phone) {
   `).get(phone);
 }
 
+function formatHour(hour, minute) {
+  const period = hour >= 12 ? 'PM' : 'AM';
+  const displayHour = hour > 12 ? hour - 12 : hour === 0 ? 12 : hour;
+  const displayMin = minute === 0 ? '00' : minute.toString().padStart(2, '0');
+  return `${displayHour}:${displayMin} ${period}`;
+}
+
 function formatTime(date) {
   return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 }
 
 function formatDate(dateStr) {
-  const d = new Date(dateStr + 'T12:00:00');
+  const d = new Date(dateStr + 'T12:00:00Z');
   return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 }
 

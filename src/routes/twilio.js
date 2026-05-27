@@ -215,12 +215,13 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
       let slots = getAvailableSlots(business.id, targetDate);
 
+      // Filter by time of day using slotHour (business local hour, timezone-safe)
       if (intent.time_preference === 'morning') {
-        slots = slots.filter(s => s.localHour < 12);
+        slots = slots.filter(s => s.slotHour < 12);
       } else if (intent.time_preference === 'afternoon') {
-        slots = slots.filter(s => s.localHour >= 12 && s.localHour < 17);
+        slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
       } else if (intent.time_preference === 'evening') {
-        slots = slots.filter(s => s.localHour >= 17);
+        slots = slots.filter(s => s.slotHour >= 17);
       }
 
       if (slots.length === 0) {
