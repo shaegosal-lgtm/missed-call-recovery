@@ -216,11 +216,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       let targetDate = parsedDate ||
         new Date(new Date().setDate(new Date().getDate() + 1)).toISOString().split('T')[0];
 
-      console.log(`Booking - date: ${targetDate}, preference: ${timePreference}`);
-
       let slots = getAvailableSlots(business.id, targetDate);
-
-      console.log(`All slot hours:`, JSON.stringify(slots.map(s => ({ label: s.label, slotHour: s.slotHour }))));
 
       if (timePreference === 'morning') {
         slots = slots.filter(s => s.slotHour < 12);
@@ -229,8 +225,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       } else if (timePreference === 'evening') {
         slots = slots.filter(s => s.slotHour >= 17);
       }
-
-      console.log(`Slots after filter: ${slots.length}`);
 
       if (slots.length === 0) {
         const available = getNextAvailableDays(business.id, 7);
