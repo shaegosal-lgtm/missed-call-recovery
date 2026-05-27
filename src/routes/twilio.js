@@ -16,13 +16,46 @@ const {
   formatDate,
 } = require('../services/schedulingService');
 
+function parseDayFromText(text) {
+  const t = text.toLowerCase();
+  const today = new Date();
+  const todayDay = today.getDay();
+
+  const days = {
+    'sunday': 0, 'monday': 1, 'tuesday': 2, 'wednesday': 3,
+    'thursday': 4, 'friday': 5, 'saturday': 6
+  };
+
+  if (t.includes('tomorrow')) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+    return tomorrow.toISOString().split('T')[0];
+  }
+
+  if (t.includes('today')) {
+    return today.toISOString().split('T')[0];
+  }
+
+  for (const [dayName, dayNum] of Object.entries(days)) {
+    if (t.includes(dayName)) {
+      let daysAhead = dayNum - todayDay;
+      if (daysAhead <= 0) daysAhead += 7;
+      const target = new Date(today);
+      target.setDate(today.getDate() + daysAhead);
+      return target.toISOString().split('T')[0];
+    }
+  }
+
+  return null;
+}
+
 function looksLikeBooking(text) {
   const t = text.toLowerCase();
   const timeWords = [
     'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
     'tomorrow','today','next week','morning','afternoon','evening','night',
     'am','pm','book','schedule','appointment','come in','visit','available',
-    'monday','tuesday','anytime','soon','asap','weekend'
+    'anytime','soon','asap','weekend'
   ];
   return timeWords.some(w => t.includes(w));
 }
@@ -106,7 +139,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     const convo = JSON.parse(lead.conversation || '[]');
     const upperText = text.toUpperCase();
 
-    // Handle CANCEL keyword directly
     if (upperText === 'CANCEL') {
       const appt = getAppointmentByPhone(From);
       if (!appt) {
@@ -118,7 +150,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    // Handle slot selection (1, 2, or 3)
     if (/^[123]$/.test(text.trim())) {
       const recentSystem = [...convo].reverse().find(m => m.role === 'system');
 
@@ -162,8 +193,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    // Check if message looks like a booking/time request
-    if (looksLikeBooking(text)) {console.log('Looking for business with number:', process.env.TWILIO_PHONE_NUMBER);
+    if (looksLikeBooking(text)) {
       const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?')
         .get(process.env.TWILIO_PHONE_NUMBER);
 
@@ -172,7 +202,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         return res.status(200).send('<Response></Response>');
       }
 
-      // Use Claude to extract date/time preference
       let intent = { intent: 'book', time_preference: null, preferred_date: null };
       try {
         intent = await detectBookingIntent(text, convo);
@@ -180,9 +209,9 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         console.error('Intent detection failed:', err);
       }
 
-      const today = new Date();
-      let targetDate = intent.preferred_date ||
-        new Date(today.setDate(today.getDate() + 1)).toISOString().split('T')[0];
+      const parsedDate = parseDayFromText(text);
+      let targetDate = parsedDate || intent.preferred_date ||
+        new Date(new Date().setDate(new Date().getDate() + 1)).toISOString().split('T')[0];
 
       let slots = getAvailableSlots(business.id, targetDate);
 
