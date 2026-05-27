@@ -3,7 +3,7 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db/db');
 const { sendSMS } = require('../services/twilioService');
-const { classifyLead, detectBookingIntent } = require('../services/claudeService');
+const { classifyLead } = require('../services/claudeService');
 const { createLead, getLeadByPhone, updateLead, appendToConversation } = require('../services/leadService');
 const { notifyOwner } = require('../services/notifyService');
 const twilioAuth = require('../middleware/twilioAuth');
@@ -46,6 +46,14 @@ function parseDayFromText(text) {
     }
   }
 
+  return null;
+}
+
+function getTimePreference(text) {
+  const t = text.toLowerCase();
+  if (t.includes('morning') || t.includes('am')) return 'morning';
+  if (t.includes('afternoon') || t.includes('lunch') || t.includes('midday')) return 'afternoon';
+  if (t.includes('evening') || t.includes('night') || t.includes('pm')) return 'evening';
   return null;
 }
 
@@ -202,27 +210,27 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         return res.status(200).send('<Response></Response>');
       }
 
-      let intent = { intent: 'book', time_preference: null, preferred_date: null };
-      try {
-        intent = await detectBookingIntent(text, convo);
-      } catch (err) {
-        console.error('Intent detection failed:', err);
-      }
-
       const parsedDate = parseDayFromText(text);
-      let targetDate = parsedDate || intent.preferred_date ||
+      const timePreference = getTimePreference(text);
+
+      let targetDate = parsedDate ||
         new Date(new Date().setDate(new Date().getDate() + 1)).toISOString().split('T')[0];
+
+      console.log(`Booking - date: ${targetDate}, preference: ${timePreference}`);
 
       let slots = getAvailableSlots(business.id, targetDate);
 
-      // Filter by time of day using slotHour (business local hour, timezone-safe)
-      if (intent.time_preference === 'morning') {
+      console.log(`All slot hours:`, JSON.stringify(slots.map(s => ({ label: s.label, slotHour: s.slotHour }))));
+
+      if (timePreference === 'morning') {
         slots = slots.filter(s => s.slotHour < 12);
-      } else if (intent.time_preference === 'afternoon') {
+      } else if (timePreference === 'afternoon') {
         slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
-      } else if (intent.time_preference === 'evening') {
+      } else if (timePreference === 'evening') {
         slots = slots.filter(s => s.slotHour >= 17);
       }
+
+      console.log(`Slots after filter: ${slots.length}`);
 
       if (slots.length === 0) {
         const available = getNextAvailableDays(business.id, 7);
