@@ -16,6 +16,14 @@ const {
   formatDate,
 } = require('../services/schedulingService');
 
+function getNextWeekday(date) {
+  const d = new Date(date);
+  const day = d.getDay();
+  if (day === 6) d.setDate(d.getDate() + 2); // Saturday -> Monday
+  if (day === 0) d.setDate(d.getDate() + 1); // Sunday -> Monday
+  return d.toISOString().split('T')[0];
+}
+
 function parseDayFromText(text) {
   const t = text.toLowerCase();
   const today = new Date();
@@ -29,11 +37,26 @@ function parseDayFromText(text) {
   if (t.includes('tomorrow')) {
     const tomorrow = new Date(today);
     tomorrow.setDate(today.getDate() + 1);
-    return tomorrow.toISOString().split('T')[0];
+    return getNextWeekday(tomorrow);
   }
 
   if (t.includes('today')) {
-    return today.toISOString().split('T')[0];
+    return getNextWeekday(today);
+  }
+
+  if (t.includes('weekend')) {
+    // Weekend request — bump to Monday
+    const monday = new Date(today);
+    const daysUntilMonday = (8 - todayDay) % 7 || 7;
+    monday.setDate(today.getDate() + daysUntilMonday);
+    return monday.toISOString().split('T')[0];
+  }
+
+  if (t.includes('next week')) {
+    const monday = new Date(today);
+    const daysUntilMonday = (8 - todayDay) % 7 || 7;
+    monday.setDate(today.getDate() + daysUntilMonday);
+    return monday.toISOString().split('T')[0];
   }
 
   for (const [dayName, dayNum] of Object.entries(days)) {
@@ -42,7 +65,8 @@ function parseDayFromText(text) {
       if (daysAhead <= 0) daysAhead += 7;
       const target = new Date(today);
       target.setDate(today.getDate() + daysAhead);
-      return target.toISOString().split('T')[0];
+      // If they ask for Saturday/Sunday, bump to Monday
+      return getNextWeekday(target);
     }
   }
 
@@ -214,7 +238,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       const timePreference = getTimePreference(text);
 
       let targetDate = parsedDate ||
-        new Date(new Date().setDate(new Date().getDate() + 1)).toISOString().split('T')[0];
+        getNextWeekday(new Date(new Date().setDate(new Date().getDate() + 1)));
 
       let slots = getAvailableSlots(business.id, targetDate);
 
