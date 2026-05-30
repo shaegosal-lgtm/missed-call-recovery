@@ -1,7 +1,14 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, '../../database.sqlite'));
+// Use /data volume in production, local folder in development
+const dbPath = process.env.RAILWAY_ENVIRONMENT
+  ? '/data/database.sqlite'
+  : path.join(__dirname, '../../database.sqlite');
+
+console.log('Database path:', dbPath);
+
+const db = new Database(dbPath);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS calls (
