@@ -3,6 +3,7 @@ console.log('ENV CHECK - SID starts with:', process.env.TWILIO_ACCOUNT_SID?.subs
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db/db');
+const { startReminderJob } = require('./services/reminderService');
 
 const twilioRoutes = require('./routes/twilio');
 const leadRoutes = require('./routes/leads');
@@ -20,10 +21,10 @@ app.use('/api/appointments', appointmentRoutes);
 
 app.get('/', (req, res) => res.send('Missed call recovery server is running.'));
 
-// Run migrations — add new columns safely
 function runMigrations() {
   const migrations = [
     `ALTER TABLE businesses ADD COLUMN business_phone TEXT`,
+    `ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`,
   ];
 
   migrations.forEach(sql => {
@@ -63,6 +64,7 @@ function setupBusiness() {
 
 runMigrations();
 setupBusiness();
+startReminderJob();
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
