@@ -20,7 +20,22 @@ app.use('/api/appointments', appointmentRoutes);
 
 app.get('/', (req, res) => res.send('Missed call recovery server is running.'));
 
-// Auto-setup business on start if not exists
+// Run migrations — add new columns safely
+function runMigrations() {
+  const migrations = [
+    `ALTER TABLE businesses ADD COLUMN business_phone TEXT`,
+  ];
+
+  migrations.forEach(sql => {
+    try {
+      db.exec(sql);
+      console.log('Migration applied:', sql);
+    } catch (e) {
+      // Column already exists — skip silently
+    }
+  });
+}
+
 function setupBusiness() {
   const twilioNumber = process.env.TWILIO_PHONE_NUMBER;
   const ownerPhone = process.env.OWNER_PHONE_NUMBER;
@@ -46,6 +61,7 @@ function setupBusiness() {
   console.log('Business auto-created:', id);
 }
 
+runMigrations();
 setupBusiness();
 
 app.listen(PORT, () => {
