@@ -1,7 +1,6 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-// Use /data volume in production, local folder in development
 const dbPath = process.env.RAILWAY_ENVIRONMENT
   ? '/data/database.sqlite'
   : path.join(__dirname, '../../database.sqlite');
@@ -38,6 +37,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     phone TEXT,
+    business_phone TEXT,
     owner_phone TEXT NOT NULL,
     timezone TEXT DEFAULT 'America/Toronto',
     appointment_duration_mins INTEGER DEFAULT 60,

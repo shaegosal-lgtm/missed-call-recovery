@@ -19,8 +19,8 @@ const {
 function getNextWeekday(date) {
   const d = new Date(date);
   const day = d.getDay();
-  if (day === 6) d.setDate(d.getDate() + 2); // Saturday -> Monday
-  if (day === 0) d.setDate(d.getDate() + 1); // Sunday -> Monday
+  if (day === 6) d.setDate(d.getDate() + 2);
+  if (day === 0) d.setDate(d.getDate() + 1);
   return d.toISOString().split('T')[0];
 }
 
@@ -44,15 +44,7 @@ function parseDayFromText(text) {
     return getNextWeekday(today);
   }
 
-  if (t.includes('weekend')) {
-    // Weekend request — bump to Monday
-    const monday = new Date(today);
-    const daysUntilMonday = (8 - todayDay) % 7 || 7;
-    monday.setDate(today.getDate() + daysUntilMonday);
-    return monday.toISOString().split('T')[0];
-  }
-
-  if (t.includes('next week')) {
+  if (t.includes('weekend') || t.includes('next week')) {
     const monday = new Date(today);
     const daysUntilMonday = (8 - todayDay) % 7 || 7;
     monday.setDate(today.getDate() + daysUntilMonday);
@@ -65,7 +57,6 @@ function parseDayFromText(text) {
       if (daysAhead <= 0) daysAhead += 7;
       const target = new Date(today);
       target.setDate(today.getDate() + daysAhead);
-      // If they ask for Saturday/Sunday, bump to Monday
       return getNextWeekday(target);
     }
   }
@@ -96,7 +87,22 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
 
+  // Look up business to check if call forwarding is configured
+  const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(To);
+
+  // Initial call coming in — forward to real business phone if configured
   if (!CallStatus || CallStatus === 'ringing' || CallStatus === 'in-progress') {
+    if (business && business.business_phone) {
+      return res.status(200).type('text/xml').send(`
+        <Response>
+          <Dial timeout="20" action="/webhooks/twilio/missed-call-fallback" method="POST">
+            <Number>${business.business_phone}</Number>
+          </Dial>
+        </Response>
+      `);
+    }
+
+    // No business phone configured — play message and hang up
     return res.status(200).type('text/xml').send(`
       <Response>
         <Say>Thank you for calling. We are unable to take your call right now. Please stay on the line and we will follow up with you shortly.</Say>
@@ -106,6 +112,7 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
     `);
   }
 
+  // Final call status — send SMS if missed
   if (CallStatus === 'no-answer' || CallStatus === 'busy' || CallStatus === 'failed' || CallStatus === 'completed') {
     try {
       const callId = uuidv4();
@@ -120,6 +127,33 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
       );
 
       console.log(`SMS sent to ${From}`);
+    } catch (err) {
+      console.log(`Duplicate or error: ${err.message}`);
+    }
+  }
+
+  res.status(200).type('text/xml').send('<Response></Response>');
+});
+
+// Fallback when forwarded call is not answered
+router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
+  const { From, To, CallSid, DialCallStatus } = req.body;
+  console.log(`Forwarded call fallback - From: ${From}, DialStatus: ${DialCallStatus}`);
+
+  if (DialCallStatus === 'no-answer' || DialCallStatus === 'busy' || DialCallStatus === 'failed') {
+    try {
+      const callId = uuidv4();
+      db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
+        .run(callId, From, To, CallSid, 'missed');
+
+      createLead(From, callId);
+
+      await sendSMS(From,
+        `Hi! You just called us and we missed you. We're sorry about that! ` +
+        `Can you tell us your name so we can follow up properly?`
+      );
+
+      console.log(`SMS sent to ${From} after forwarding failed`);
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
     }
