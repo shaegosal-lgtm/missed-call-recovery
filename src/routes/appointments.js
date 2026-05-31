@@ -86,4 +86,13 @@ router.post('/setup-business', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.post('/update-business-phone', (req, res) => {
+  const { twilioNumber, businessPhone } = req.body;
+  try {
+    db.exec('ALTER TABLE businesses ADD COLUMN IF NOT EXISTS business_phone TEXT');
+  } catch (e) {}
+  db.prepare('UPDATE businesses SET business_phone = ? WHERE twilio_number = ?')
+    .run(businessPhone, twilioNumber);
+  res.json({ success: true });
+});
 module.exports = router;
