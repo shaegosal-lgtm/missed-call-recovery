@@ -147,57 +147,20 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  // Analyze intent with Claude
-  let intent;
-  try {
-    intent = await analyzeIntent(text, convo);
-  } catch (err) {
-    console.error('Intent analysis failed:', err);
-    intent = {};
-  }
-
-  console.log('Intent:', JSON.stringify(intent));
-
-  // Extract and save name if detected and not already saved
-  if (intent.has_name && intent.name && !lead.name) {
-    updateLead(lead.id, { name: intent.name });
-    lead.name = intent.name;
-  }
-
-  // Handle CANCEL
-  if (intent.wants_to_cancel || text.toUpperCase() === 'CANCEL') {
-    const appt = getAppointmentByPhone(From);
-    if (!appt) {
-      const reply = await getReceptionistResponse(business || {}, lead, convo, text, null);
-      await sendSMS(From, reply);
-    } else {
-      cancelAppointment(appt.id);
-      await sendSMS(From, `Your appointment has been cancelled. Text us anytime to rebook.`);
-    }
-    return res.status(200).send('<Response></Response>');
-  }
-
-  // Handle slot selection (1, 2, or 3)
-  if (intent.selecting_slot || /^[123]$/.test(text.trim())) {
-    const recentSystem = [...convo].reverse().find(m => m.role === 'system');
-
-    if (!recentSystem) {
-      const reply = await getReceptionistResponse(business || {}, lead, convo, text, null);
-      await sendSMS(From, reply);
-      return res.status(200).send('<Response></Response>');
-    }
-
+  // PRIORITY 1: Check if there are pending slots and customer sent 1, 2, or 3
+  // This must be checked BEFORE anything else
+  const hasPendingSlots = [...convo].reverse().find(m => m.role === 'system');
+  if (hasPendingSlots && /^[123]$/.test(text.trim())) {
     let pendingData;
     try {
-      pendingData = JSON.parse(recentSystem.body);
+      pendingData = JSON.parse(hasPendingSlots.body);
     } catch {
-      await sendSMS(From, `Something went wrong. Please tell us what day you'd like to come in.`);
+      await sendSMS(From, `Something went wrong. Please tell us what day you would like to come in.`);
       return res.status(200).send('<Response></Response>');
     }
 
     const { pendingSlots, businessId } = pendingData;
-    const slotNum = intent.slot_number || parseInt(text.trim());
-    const index = slotNum - 1;
+    const index = parseInt(text.trim()) - 1;
     const chosen = pendingSlots[index];
 
     if (!chosen) {
@@ -211,8 +174,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await sendSMS(From, `Sorry, that slot was just taken. What other day works for you?`);
     } else {
       await sendSMS(From,
-        `You're booked! Appointment confirmed for ${chosen.label}. ` +
-        `Your confirmation code is ${result.confirmationCode}. ` +
+        `Booked! Your appointment is confirmed for ${chosen.label}. ` +
+        `Confirmation code: ${result.confirmationCode}. ` +
         `Reply CANCEL anytime to cancel.`
       );
       await notifyOwner({
@@ -220,18 +183,46 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
       });
 
-      // Classify lead in background
       if (lead.reason) {
         classifyLead(From, lead.reason)
-          .then(result => updateLead(lead.id, {
-            urgency: result.urgency,
-            lead_type: result.lead_type,
-            ai_summary: result.summary,
+          .then(r => updateLead(lead.id, {
+            urgency: r.urgency,
+            lead_type: r.lead_type,
+            ai_summary: r.summary,
           }))
           .catch(err => console.error('Classification failed:', err));
       }
     }
     return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 2: Handle CANCEL keyword
+  if (text.toUpperCase() === 'CANCEL') {
+    const appt = getAppointmentByPhone(From);
+    if (!appt) {
+      await sendSMS(From, `We don't have an active appointment on file for your number.`);
+    } else {
+      cancelAppointment(appt.id);
+      await sendSMS(From, `Your appointment has been cancelled. Text us anytime to rebook.`);
+    }
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 3: Analyze intent with Claude
+  let intent;
+  try {
+    intent = await analyzeIntent(text, convo);
+  } catch (err) {
+    console.error('Intent analysis failed:', err);
+    intent = {};
+  }
+
+  console.log('Intent:', JSON.stringify(intent));
+
+  // Extract and save name if detected
+  if (intent.has_name && intent.name && !lead.name) {
+    updateLead(lead.id, { name: intent.name });
+    lead.name = intent.name;
   }
 
   // Handle booking request
@@ -264,17 +255,17 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         return res.status(200).send('<Response></Response>');
       }
       const next = available[0];
-      slots = next.slots.slice(0, 3);
+      const offered = next.slots.slice(0, 3);
       const dateLabel = formatDate(next.date);
-      const options = slots.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
+      const options = offered.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
 
       appendToConversation(lead.id, 'system', JSON.stringify({
-        pendingSlots: slots.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
+        pendingSlots: offered.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
         date: next.date,
         businessId: business.id
       }));
 
-      await sendSMS(From, `We're next available on ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
+      await sendSMS(From, `We are next available on ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
     } else {
       const offered = slots.slice(0, 3);
       const dateLabel = formatDate(targetDate);
@@ -292,7 +283,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // For everything else — let Claude handle it naturally
+  // PRIORITY 4: Let Claude handle everything else naturally
   const availableSlots = business ? getAvailableSlots(business.id,
     getNextWeekday(new Date(new Date().setDate(new Date().getDate() + 1)))
   ).slice(0, 3) : [];
@@ -307,7 +298,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   await sendSMS(From, reply);
 
-  // Update lead reason if not set yet
+  // Save reason if not set yet
   if (!lead.reason && text.length > 10) {
     updateLead(lead.id, { reason: text });
     classifyLead(From, text)
