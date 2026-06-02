@@ -91,7 +91,7 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
 
       const bizName = business ? business.name : 'us';
       await sendSMS(From,
-        `Hi! You just called ${bizName} and we missed you. We're sorry about that! ` +
+        `Hi! You just called ${bizName} and we missed you. We are sorry about that! ` +
         `How can we help you today?`
       );
 
@@ -119,7 +119,7 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
 
       const bizName = business ? business.name : 'us';
       await sendSMS(From,
-        `Hi! You just called ${bizName} and we missed you. We're sorry about that! ` +
+        `Hi! You just called ${bizName} and we missed you. We are sorry about that! ` +
         `How can we help you today?`
       );
 
@@ -138,7 +138,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   const lead = getLeadByPhone(From);
   if (!lead) {
-    await sendSMS(From, `Thanks for reaching out! Please call us and we'll be happy to help.`);
+    await sendSMS(From, `Thanks for reaching out! Please call us and we will be happy to help.`);
     return res.status(200).send('<Response></Response>');
   }
 
@@ -147,13 +147,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  // PRIORITY 1: Check if there are pending slots and customer sent 1, 2, or 3
-  // This must be checked BEFORE anything else
-  const hasPendingSlots = [...convo].reverse().find(m => m.role === 'system');
-  if (hasPendingSlots && /^[123]$/.test(text.trim())) {
+  // PRIORITY 1: Pending slots + number selection — check first always
+  const recentSystem = [...convo].reverse().find(m => m.role === 'system');
+  if (recentSystem && /^[123]$/.test(text.trim())) {
     let pendingData;
     try {
-      pendingData = JSON.parse(hasPendingSlots.body);
+      pendingData = JSON.parse(recentSystem.body);
     } catch {
       await sendSMS(From, `Something went wrong. Please tell us what day you would like to come in.`);
       return res.status(200).send('<Response></Response>');
@@ -196,7 +195,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 2: Handle CANCEL keyword
+  // PRIORITY 2: CANCEL keyword
   if (text.toUpperCase() === 'CANCEL') {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
@@ -208,7 +207,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 3: Analyze intent with Claude
+  // PRIORITY 3: Analyze intent
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -219,13 +218,13 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   console.log('Intent:', JSON.stringify(intent));
 
-  // Extract and save name if detected
+  // Extract name if detected
   if (intent.has_name && intent.name && !lead.name) {
     updateLead(lead.id, { name: intent.name });
     lead.name = intent.name;
   }
 
-  // Handle booking request
+  // PRIORITY 4: Booking flow — only code handles scheduling, never Claude
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -283,17 +282,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 4: Let Claude handle everything else naturally
-  const availableSlots = business ? getAvailableSlots(business.id,
-    getNextWeekday(new Date(new Date().setDate(new Date().getDate() + 1)))
-  ).slice(0, 3) : [];
-
+  // PRIORITY 5: Claude handles general conversation only — no scheduling
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
     convo,
-    text,
-    availableSlots
+    text
   );
 
   await sendSMS(From, reply);

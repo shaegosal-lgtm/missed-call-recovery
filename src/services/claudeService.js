@@ -30,12 +30,8 @@ Urgency guide: high = pain/emergency/urgent, medium = wants appointment soon, lo
   }
 }
 
-async function getReceptionistResponse(business, lead, conversationHistory, customerMessage, availableSlots) {
+async function getReceptionistResponse(business, lead, conversationHistory, customerMessage) {
   const businessInfo = business.business_info || 'No specific business information provided.';
-
-  const slotsText = availableSlots && availableSlots.length > 0
-    ? `Available appointment slots: ${availableSlots.map((s, i) => `${i + 1}) ${s.label}`).join(', ')}`
-    : null;
 
   const filteredHistory = conversationHistory
     .filter(m => !m.body.includes('"pendingSlots"'))
@@ -47,30 +43,31 @@ async function getReceptionistResponse(business, lead, conversationHistory, cust
 BUSINESS INFORMATION:
 ${businessInfo}
 
-YOUR RULES — follow these exactly:
-1. No emojis ever. This is a professional business.
-2. Keep every message under 160 characters when possible.
-3. Never repeat information you already said in this conversation.
-4. When booking, always ask for the DAY first, then the time preference after they answer.
-5. Never ask two questions in one message — one question at a time only.
-6. For anything not in the business information, say "A team member will follow up with you on that."
-7. Never make up prices, services, or details not listed above.
-8. If someone says wrong number, apologize briefly and end the conversation.
-9. Be warm but concise — this is SMS, not email.
-10. Never use bullet points or numbered lists in your responses.
-
-${slotsText ? `AVAILABLE SLOTS TO OFFER: ${slotsText}. If offering slots, ask the customer to reply with 1, 2, or 3.` : ''}
+STRICT RULES — never break these:
+1. NEVER mention specific times, dates, or appointment slots. You do not have access to the schedule.
+2. NEVER confirm, suggest, or imply that any specific time is available.
+3. If a customer asks about availability or wants to book, say "What day works best for you?" and nothing more about times.
+4. The booking system will handle all scheduling automatically after the customer states a day.
+5. No emojis ever. Professional tone only.
+6. Keep every message under 160 characters.
+7. Never repeat something already said in this conversation.
+8. Ask only one question per message.
+9. For anything not in the business information, say "A team member will follow up with you on that."
+10. Never make up prices, services, or details not listed in the business information.
+11. If someone says wrong number, apologize briefly and stop responding.
+12. Be warm but concise — this is SMS.
+13. Never use bullet points or numbered lists.
 
 CONVERSATION SO FAR:
 ${filteredHistory}
 
 Customer just said: "${customerMessage}"
 
-Reply as the receptionist. One short message only. No emojis. Professional tone.`;
+Reply as the receptionist. One short message. No emojis. No times or dates. Professional.`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
-    max_tokens: 300,
+    max_tokens: 200,
     messages: [{ role: 'user', content: systemPrompt }],
   });
 
@@ -81,7 +78,7 @@ async function analyzeIntent(message, conversationHistory) {
   const prompt = `Analyze this SMS message from a customer and return ONLY a JSON object.
 
 Message: "${message}"
-Recent conversation: ${JSON.stringify(conversationHistory.slice(-4))}
+Recent conversation: ${JSON.stringify(conversationHistory.slice(-6))}
 
 Return ONLY this JSON with no explanation:
 {
@@ -95,7 +92,10 @@ Return ONLY this JSON with no explanation:
   "is_wrong_number": true or false,
   "has_name": true or false,
   "name": "extracted name or null"
-}`;
+}
+
+Rules for wants_to_book: set true if customer mentions any day, time, or expresses desire to come in or schedule anything.
+Rules for selecting_slot: set true if message is just a number 1, 2, or 3 and conversation shows slots were recently offered.`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
