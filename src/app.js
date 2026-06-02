@@ -25,6 +25,7 @@ function runMigrations() {
   const migrations = [
     `ALTER TABLE businesses ADD COLUMN business_phone TEXT`,
     `ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`,
+    `ALTER TABLE businesses ADD COLUMN business_info TEXT`,
   ];
 
   migrations.forEach(sql => {

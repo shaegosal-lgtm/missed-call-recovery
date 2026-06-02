@@ -3,7 +3,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 async function classifyLead(phone, reason) {
-  const prompt = `You are helping a small appointment-based business (like a dental office, salon, or clinic) qualify missed call leads.
+  const prompt = `You are helping a small appointment-based business qualify missed call leads.
 
 A customer called and didn't get through. They texted back with this reason: "${reason}"
 Their phone number is: ${phone}
@@ -30,32 +30,80 @@ Urgency guide: high = pain/emergency/urgent, medium = wants appointment soon, lo
   }
 }
 
-async function detectBookingIntent(message, conversationHistory) {
-  const prompt = `You are an AI assistant for an appointment-based business handling SMS conversations.
+async function getReceptionistResponse(business, lead, conversationHistory, customerMessage, availableSlots) {
+  const businessInfo = business.business_info || 'No specific business information provided.';
+  const hoursInfo = business.hours_description || 'Monday to Friday, 9am to 5pm';
 
-Analyze this customer message and determine their intent. Be GENEROUS in interpreting booking intent — if someone mentions a day, time, or time of day (like "tomorrow", "monday", "afternoon", "morning") they almost certainly want to book.
+  const slotsText = availableSlots && availableSlots.length > 0
+    ? `Available appointment slots: ${availableSlots.map((s, i) => `${i + 1}) ${s.label}`).join(', ')}`
+    : null;
 
-Customer message: "${message}"
-Recent conversation: ${JSON.stringify(conversationHistory.slice(-4))}
+  const systemPrompt = `You are an AI receptionist for ${business.name}. You handle missed call follow-ups via SMS.
 
-Respond ONLY with valid JSON in this exact format:
-{
-  "intent": "book" | "reschedule" | "cancel" | "check_availability" | "confirm" | "decline" | "other",
-  "preferred_date": "YYYY-MM-DD or null",
-  "preferred_time": "HH:MM in 24hr format or null",
-  "time_preference": "morning" | "afternoon" | "evening" | null,
-  "selected_slot_index": "0-based index if customer picked from a list, otherwise null",
-  "confidence": "high" | "medium" | "low"
+BUSINESS INFORMATION:
+${businessInfo}
+
+Business hours: ${hoursInfo}
+
+YOUR ROLE:
+- You are friendly, professional, and helpful
+- You respond via SMS so keep messages concise (under 160 characters when possible)
+- Your goal is to help the customer and book appointments when appropriate
+- You represent the business professionally at all times
+
+WHAT YOU CAN DO:
+- Answer questions about the business using the business information above
+- Help customers book appointments
+- Collect customer name and reason for calling naturally in conversation
+- Handle cancellations and rescheduling
+- For anything you don't know (specific pricing not listed, specific staff, etc.) say "A team member will follow up with you on that"
+
+APPOINTMENT BOOKING:
+${slotsText ? `When a customer wants to book, offer these slots: ${slotsText}. Ask them to reply with 1, 2, or 3.` : 'If a customer wants to book, ask what day and time works for them.'}
+
+IMPORTANT RULES:
+- Never make up information not in the business information section
+- Never promise specific prices unless listed in business information
+- Always be warm and empathetic — the customer missed getting through
+- If someone says wrong number, apologize and end the conversation politely
+- Keep SMS responses short and conversational
+- Never use bullet points or long lists in SMS
+
+CONVERSATION HISTORY:
+${conversationHistory.map(m => `${m.role === 'customer' ? 'Customer' : 'You'}: ${m.body}`).filter(m => !m.includes('"pendingSlots"')).join('\n')}
+
+Customer's latest message: "${customerMessage}"
+
+Respond naturally as the AI receptionist. Be concise for SMS.`;
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 300,
+    messages: [{ role: 'user', content: systemPrompt }],
+  });
+
+  return response.content[0].text.trim();
 }
 
-Examples:
-- "tomorrow afternoon" → intent: "book", time_preference: "afternoon"
-- "monday morning" → intent: "book", time_preference: "morning"  
-- "I want to come in" → intent: "book"
-- "can I book for next week" → intent: "book"
-- "yes" or "1" or "2" or "3" → intent: "confirm"
-- "cancel my appointment" → intent: "cancel"
-- "reschedule" → intent: "reschedule"`;
+async function analyzeIntent(message, conversationHistory) {
+  const prompt = `Analyze this SMS message from a customer and return ONLY a JSON object.
+
+Message: "${message}"
+Recent conversation: ${JSON.stringify(conversationHistory.slice(-4))}
+
+Return ONLY this JSON with no explanation:
+{
+  "wants_to_book": true or false,
+  "wants_to_cancel": true or false,
+  "wants_to_reschedule": true or false,
+  "selecting_slot": true or false,
+  "slot_number": 1 or 2 or 3 or null,
+  "preferred_day": "monday/tuesday/wednesday/thursday/friday/tomorrow/today or null",
+  "time_preference": "morning/afternoon/evening or null",
+  "is_wrong_number": true or false,
+  "has_name": true or false,
+  "name": "extracted name or null"
+}`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
@@ -66,8 +114,19 @@ Examples:
   try {
     return JSON.parse(response.content[0].text);
   } catch {
-    return { intent: 'other', confidence: 'low' };
+    return {
+      wants_to_book: false,
+      wants_to_cancel: false,
+      wants_to_reschedule: false,
+      selecting_slot: false,
+      slot_number: null,
+      preferred_day: null,
+      time_preference: null,
+      is_wrong_number: false,
+      has_name: false,
+      name: null
+    };
   }
 }
 
-module.exports = { classifyLead, detectBookingIntent };
+module.exports = { classifyLead, getReceptionistResponse, analyzeIntent };
