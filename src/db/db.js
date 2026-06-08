@@ -42,6 +42,7 @@ db.exec(`
     timezone TEXT DEFAULT 'America/Toronto',
     appointment_duration_mins INTEGER DEFAULT 60,
     twilio_number TEXT UNIQUE NOT NULL,
+    business_info TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -64,6 +65,7 @@ db.exec(`
     service_type TEXT,
     notes TEXT,
     confirmation_code TEXT UNIQUE,
+    reminder_sent INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
@@ -74,6 +76,15 @@ db.exec(`
     start_time DATETIME NOT NULL,
     end_time DATETIME NOT NULL,
     reason TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    business_id TEXT REFERENCES businesses(id),
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'business',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 

@@ -21,7 +21,7 @@ app.use(session({
   secret: process.env.ADMIN_KEY || 'fallback-secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 24 hours
+  cookie: { maxAge: 24 * 60 * 60 * 1000 }
 }));
 
 app.use('/webhooks/twilio', twilioRoutes);
@@ -37,6 +37,14 @@ function runMigrations() {
     `ALTER TABLE businesses ADD COLUMN business_phone TEXT`,
     `ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`,
     `ALTER TABLE businesses ADD COLUMN business_info TEXT`,
+    `CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      business_id TEXT REFERENCES businesses(id),
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT DEFAULT 'business',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
   ];
 
   migrations.forEach(sql => {
@@ -44,7 +52,7 @@ function runMigrations() {
       db.exec(sql);
       console.log('Migration applied:', sql);
     } catch (e) {
-      // Column already exists — skip silently
+      // Already exists — skip silently
     }
   });
 }
