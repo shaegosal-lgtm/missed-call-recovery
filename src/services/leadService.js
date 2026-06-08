@@ -11,7 +11,7 @@ function createLead(phone, callId) {
 
 function getLeadByPhone(phone) {
   return db.prepare(`
-    SELECT * FROM leads WHERE phone = ? AND status = 'new' ORDER BY created_at DESC LIMIT 1
+    SELECT * FROM leads WHERE phone = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1
   `).get(phone);
 }
 

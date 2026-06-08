@@ -55,6 +55,12 @@ function parseDayFromText(day) {
   return getNextWeekday(new Date(today.setDate(today.getDate() + 1)));
 }
 
+// Send SMS and log it to the conversation at the same time
+async function sendAndLog(leadId, to, message) {
+  await sendSMS(to, message);
+  if (leadId) appendToConversation(leadId, 'assistant', message);
+}
+
 router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
@@ -87,13 +93,12 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
         .run(callId, From, To, CallSid, 'missed');
 
-      createLead(From, callId);
-
+      const leadId = createLead(From, callId);
       const bizName = business ? business.name : 'us';
-      await sendSMS(From,
-        `Hi! You just called ${bizName} and we missed you. We are sorry about that! ` +
-        `How can we help you today?`
-      );
+      const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
+
+      await sendSMS(From, firstMessage);
+      appendToConversation(leadId, 'assistant', firstMessage);
 
       console.log(`SMS sent to ${From}`);
     } catch (err) {
@@ -115,13 +120,12 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
         .run(callId, From, To, CallSid, 'missed');
 
-      createLead(From, callId);
-
+      const leadId = createLead(From, callId);
       const bizName = business ? business.name : 'us';
-      await sendSMS(From,
-        `Hi! You just called ${bizName} and we missed you. We are sorry about that! ` +
-        `How can we help you today?`
-      );
+      const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
+
+      await sendSMS(From, firstMessage);
+      appendToConversation(leadId, 'assistant', firstMessage);
 
       console.log(`SMS sent to ${From} after forwarding failed`);
     } catch (err) {
@@ -147,14 +151,14 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  // PRIORITY 1: Pending slots + number selection — check first always
+  // PRIORITY 1: Pending slots + number selection
   const recentSystem = [...convo].reverse().find(m => m.role === 'system');
   if (recentSystem && /^[123]$/.test(text.trim())) {
     let pendingData;
     try {
       pendingData = JSON.parse(recentSystem.body);
     } catch {
-      await sendSMS(From, `Something went wrong. Please tell us what day you would like to come in.`);
+      await sendAndLog(lead.id, From, `Something went wrong. Please tell us what day you would like to come in.`);
       return res.status(200).send('<Response></Response>');
     }
 
@@ -163,20 +167,17 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     const chosen = pendingSlots[index];
 
     if (!chosen) {
-      await sendSMS(From, `Please reply with 1, 2, or 3 to select a time.`);
+      await sendAndLog(lead.id, From, `Please reply with 1, 2, or 3 to select a time.`);
       return res.status(200).send('<Response></Response>');
     }
 
     const result = bookAppointment(businessId, lead.id, chosen.start);
 
     if (!result.success) {
-      await sendSMS(From, `Sorry, that slot was just taken. What other day works for you?`);
+      await sendAndLog(lead.id, From, `Sorry, that slot was just taken. What other day works for you?`);
     } else {
-      await sendSMS(From,
-        `Booked! Your appointment is confirmed for ${chosen.label}. ` +
-        `Confirmation code: ${result.confirmationCode}. ` +
-        `Reply CANCEL anytime to cancel.`
-      );
+      const confirmMsg = `Booked! Your appointment is confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. Reply CANCEL anytime to cancel.`;
+      await sendAndLog(lead.id, From, confirmMsg);
       await notifyOwner({
         ...lead,
         ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
@@ -199,10 +200,10 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (text.toUpperCase() === 'CANCEL') {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
-      await sendSMS(From, `We don't have an active appointment on file for your number.`);
+      await sendAndLog(lead.id, From, `We don't have an active appointment on file for your number.`);
     } else {
       cancelAppointment(appt.id);
-      await sendSMS(From, `Your appointment has been cancelled. Text us anytime to rebook.`);
+      await sendAndLog(lead.id, From, `Your appointment has been cancelled. Text us anytime to rebook.`);
     }
     return res.status(200).send('<Response></Response>');
   }
@@ -224,7 +225,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lead.name = intent.name;
   }
 
-  // PRIORITY 4: Booking flow — only code handles scheduling, never Claude
+  // PRIORITY 4: Booking flow
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -232,7 +233,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     if (!business) {
-      await sendSMS(From, `A team member will reach out shortly to schedule your appointment.`);
+      await sendAndLog(lead.id, From, `A team member will reach out shortly to schedule your appointment.`);
       return res.status(200).send('<Response></Response>');
     }
 
@@ -250,7 +251,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (slots.length === 0) {
       const available = getNextAvailableDays(business.id, 7);
       if (available.length === 0) {
-        await sendSMS(From, `We don't have any openings in the next week. A team member will call you to schedule.`);
+        await sendAndLog(lead.id, From, `We don't have any openings in the next week. A team member will call you to schedule.`);
         return res.status(200).send('<Response></Response>');
       }
       const next = available[0];
@@ -264,7 +265,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         businessId: business.id
       }));
 
-      await sendSMS(From, `We are next available on ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
+      const msg = `We are next available on ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`;
+      await sendAndLog(lead.id, From, msg);
     } else {
       const offered = slots.slice(0, 3);
       const dateLabel = formatDate(targetDate);
@@ -276,13 +278,14 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         businessId: business.id
       }));
 
-      await sendSMS(From, `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to book your spot.`);
+      const msg = `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to book your spot.`;
+      await sendAndLog(lead.id, From, msg);
     }
 
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 5: Claude handles general conversation only — no scheduling
+  // PRIORITY 5: Claude handles general conversation
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
@@ -290,7 +293,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     text
   );
 
-  await sendSMS(From, reply);
+  await sendAndLog(lead.id, From, reply);
 
   // Save reason if not set yet
   if (!lead.reason && text.length > 10) {
