@@ -1,6 +1,7 @@
 require('dotenv').config();
 console.log('ENV CHECK - SID starts with:', process.env.TWILIO_ACCOUNT_SID?.substring(0, 4));
 const express = require('express');
+const session = require('express-session');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db/db');
 const { startReminderJob } = require('./services/reminderService');
@@ -9,19 +10,27 @@ const twilioRoutes = require('./routes/twilio');
 const leadRoutes = require('./routes/leads');
 const appointmentRoutes = require('./routes/appointments');
 const adminRoutes = require('./routes/admin');
+const dashboardRoutes = require('./routes/dashboard');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(session({
+  secret: process.env.ADMIN_KEY || 'fallback-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 24 hours
+}));
 
 app.use('/webhooks/twilio', twilioRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/appointments', appointmentRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/dashboard', dashboardRoutes);
 
-app.get('/', (req, res) => res.send('Missed call recovery server is running.'));
+app.get('/', (req, res) => res.redirect('/dashboard'));
 
 function runMigrations() {
   const migrations = [
