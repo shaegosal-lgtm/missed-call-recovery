@@ -60,6 +60,17 @@ async function sendAndLog(leadId, to, message) {
   if (leadId) appendToConversation(leadId, 'assistant', message);
 }
 
+function isYes(text) {
+  const t = text.toLowerCase().trim();
+  return ['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'definitely', 
+          'absolutely', 'please', 'yes please', 'sounds good', 'of course'].includes(t);
+}
+
+function isNo(text) {
+  const t = text.toLowerCase().trim();
+  return ['no', 'nope', 'nah', 'not now', 'no thanks', 'no thank you'].includes(t);
+}
+
 router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
@@ -175,7 +186,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (!result.success) {
       await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
     } else {
-      // Now collect name after booking confirmed
       const confirmMsg = `You are all set! Your appointment is confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. Reply CANCEL anytime to cancel. May I get your name for our records?`;
       await sendAndLog(lead.id, From, confirmMsg);
       updateLead(lead.id, { status: 'scheduled' });
@@ -210,11 +220,9 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   }
 
   // PRIORITY 3: First message — customer just gave their reason
-  // Acknowledge and ask if they want to book — no Claude needed
   if (!lead.reason && text.length > 3) {
     updateLead(lead.id, { reason: text });
 
-    // Run classification in background
     classifyLead(From, text)
       .then(result => {
         updateLead(lead.id, {
@@ -230,7 +238,23 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 4: Analyze intent
+  // PRIORITY 4: Customer said yes to booking — ask for day immediately
+  const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
+  const lastMsgWasBookingQuestion = lastAssistantMsg &&
+    lastAssistantMsg.body.toLowerCase().includes('book an appointment');
+
+  if (lastMsgWasBookingQuestion && isYes(text)) {
+    await sendAndLog(lead.id, From, `What day works best for you?`);
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 5: Customer said no to booking
+  if (lastMsgWasBookingQuestion && isNo(text)) {
+    await sendAndLog(lead.id, From, `No problem. A team member will be in touch with you shortly.`);
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 6: Analyze intent
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -247,7 +271,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lead.name = intent.name;
   }
 
-  // PRIORITY 5: Booking flow
+  // PRIORITY 7: Booking flow
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -259,14 +283,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    // Use specific date if provided, otherwise use day name
     let targetDate = null;
     if (intent.preferred_date) {
       targetDate = getNextWeekday(new Date(intent.preferred_date));
     } else if (intent.preferred_day) {
       targetDate = parseDayFromText(intent.preferred_day);
     } else {
-      // No date yet — ask for it
       await sendAndLog(lead.id, From, `What day works best for you?`);
       return res.status(200).send('<Response></Response>');
     }
@@ -316,7 +338,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 6: Claude handles everything else
+  // PRIORITY 8: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
