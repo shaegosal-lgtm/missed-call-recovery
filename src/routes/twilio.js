@@ -55,6 +55,75 @@ function parseDayFromText(day) {
   return getNextWeekday(new Date(today.setDate(today.getDate() + 1)));
 }
 
+function parseDateFromMessage(text) {
+  const t = text.toLowerCase().trim();
+  const today = new Date();
+  const todayDay = today.getDay();
+
+  const days = {
+    'sunday': 0, 'monday': 1, 'tuesday': 2, 'wednesday': 3,
+    'thursday': 4, 'friday': 5, 'saturday': 6
+  };
+
+  // Check for day names
+  for (const [dayName, dayNum] of Object.entries(days)) {
+    if (t.includes(dayName)) {
+      let daysAhead = dayNum - todayDay;
+      if (daysAhead <= 0) daysAhead += 7;
+      const target = new Date(today);
+      target.setDate(today.getDate() + daysAhead);
+      return getNextWeekday(target);
+    }
+  }
+
+  if (t.includes('tomorrow')) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+    return getNextWeekday(tomorrow);
+  }
+
+  if (t.includes('today')) {
+    return getNextWeekday(today);
+  }
+
+  if (t.includes('next week')) {
+    const monday = new Date(today);
+    const daysUntilMonday = (8 - todayDay) % 7 || 7;
+    monday.setDate(today.getDate() + daysUntilMonday);
+    return monday.toISOString().split('T')[0];
+  }
+
+  // Check for specific dates like "June 1st", "June 1", "the 15th"
+  const months = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12
+  };
+
+  for (const [monthName, monthNum] of Object.entries(months)) {
+    if (t.includes(monthName)) {
+      const match = t.match(/(\d+)/);
+      if (match) {
+        const day = parseInt(match[1]);
+        const year = today.getFullYear();
+        const date = new Date(year, monthNum - 1, day);
+        if (date < today) date.setFullYear(year + 1);
+        return getNextWeekday(date);
+      }
+    }
+  }
+
+  return null;
+}
+
+function getTimePreferenceFromText(text) {
+  const t = text.toLowerCase();
+  if (t.includes('morning') || t.includes(' am')) return 'morning';
+  if (t.includes('afternoon') || t.includes('lunch')) return 'afternoon';
+  if (t.includes('evening') || t.includes('night') || t.includes(' pm')) return 'evening';
+  return null;
+}
+
 async function sendAndLog(leadId, to, message) {
   await sendSMS(to, message);
   if (leadId) appendToConversation(leadId, 'assistant', message);
@@ -62,13 +131,53 @@ async function sendAndLog(leadId, to, message) {
 
 function isYes(text) {
   const t = text.toLowerCase().trim();
-  return ['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'definitely', 
-          'absolutely', 'please', 'yes please', 'sounds good', 'of course'].includes(t);
+  return ['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'definitely',
+    'absolutely', 'please', 'yes please', 'sounds good', 'of course'].includes(t);
 }
 
 function isNo(text) {
   const t = text.toLowerCase().trim();
   return ['no', 'nope', 'nah', 'not now', 'no thanks', 'no thank you'].includes(t);
+}
+
+async function showSlotsForDate(lead, business, targetDate, timePreference, From) {
+  let slots = getAvailableSlots(business.id, targetDate);
+
+  if (timePreference === 'morning') slots = slots.filter(s => s.slotHour < 12);
+  else if (timePreference === 'afternoon') slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
+  else if (timePreference === 'evening') slots = slots.filter(s => s.slotHour >= 17);
+
+  if (slots.length === 0) {
+    const available = getNextAvailableDays(business.id, 7);
+    if (available.length === 0) {
+      await sendAndLog(lead.id, From, `We do not have any openings in the next week. A team member will call you to get you scheduled.`);
+      return;
+    }
+    const next = available[0];
+    const offered = next.slots.slice(0, 3);
+    const dateLabel = formatDate(next.date);
+    const options = offered.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
+
+    appendToConversation(lead.id, 'system', JSON.stringify({
+      pendingSlots: offered.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
+      date: next.date,
+      businessId: business.id
+    }));
+
+    await sendAndLog(lead.id, From, `We are not available that day. The next opening is ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
+  } else {
+    const offered = slots.slice(0, 3);
+    const dateLabel = formatDate(targetDate);
+    const options = offered.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
+
+    appendToConversation(lead.id, 'system', JSON.stringify({
+      pendingSlots: offered.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
+      date: targetDate,
+      businessId: business.id
+    }));
+
+    await sendAndLog(lead.id, From, `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to confirm your spot.`);
+  }
 }
 
 router.post('/missed-call', twilioAuth, async (req, res) => {
@@ -87,7 +196,6 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
         </Response>
       `);
     }
-
     return res.status(200).type('text/xml').send(`
       <Response>
         <Say>Thank you for calling. We are unable to take your call right now. Please stay on the line and we will follow up with you shortly.</Say>
@@ -109,7 +217,6 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
 
       await sendSMS(From, firstMessage);
       appendToConversation(leadId, 'assistant', firstMessage);
-
       console.log(`SMS sent to ${From}`);
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
@@ -136,7 +243,6 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
 
       await sendSMS(From, firstMessage);
       appendToConversation(leadId, 'assistant', firstMessage);
-
       console.log(`SMS sent to ${From} after forwarding failed`);
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
@@ -238,11 +344,17 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 4: Customer said yes to booking — ask for day immediately
+  // Check last assistant message
   const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
   const lastMsgWasBookingQuestion = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('book an appointment');
+  const lastMsgWasDayQuestion = lastAssistantMsg && (
+    lastAssistantMsg.body.toLowerCase().includes('what day works') ||
+    lastAssistantMsg.body.toLowerCase().includes('what day would') ||
+    lastAssistantMsg.body.toLowerCase().includes('what other day')
+  );
 
+  // PRIORITY 4: Customer said yes to booking
   if (lastMsgWasBookingQuestion && isYes(text)) {
     await sendAndLog(lead.id, From, `What day works best for you?`);
     return res.status(200).send('<Response></Response>');
@@ -254,7 +366,22 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 6: Analyze intent
+  // PRIORITY 6: Last message was asking for a day — treat reply as day selection
+  if (lastMsgWasDayQuestion && business) {
+    const parsedDate = parseDateFromMessage(text);
+    const timePreference = getTimePreferenceFromText(text);
+
+    if (parsedDate) {
+      await showSlotsForDate(lead, business, parsedDate, timePreference, From);
+      return res.status(200).send('<Response></Response>');
+    } else {
+      // Couldn't parse a date — ask again more specifically
+      await sendAndLog(lead.id, From, `Could you let us know a specific day, like Monday or Tuesday?`);
+      return res.status(200).send('<Response></Response>');
+    }
+  }
+
+  // PRIORITY 7: Analyze intent with Claude
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -265,13 +392,15 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   console.log('Intent:', JSON.stringify(intent));
 
-  // Extract name if detected
+  // Extract name if detected and lead is already scheduled
   if (intent.has_name && intent.name && !lead.name) {
     updateLead(lead.id, { name: intent.name });
     lead.name = intent.name;
+    await sendAndLog(lead.id, From, `Thank you ${intent.name}! We look forward to seeing you.`);
+    return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 7: Booking flow
+  // PRIORITY 8: Booking flow from intent
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -293,52 +422,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    let slots = getAvailableSlots(business.id, targetDate);
-
-    if (intent.time_preference === 'morning') {
-      slots = slots.filter(s => s.slotHour < 12);
-    } else if (intent.time_preference === 'afternoon') {
-      slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
-    } else if (intent.time_preference === 'evening') {
-      slots = slots.filter(s => s.slotHour >= 17);
-    }
-
-    if (slots.length === 0) {
-      const available = getNextAvailableDays(business.id, 7);
-      if (available.length === 0) {
-        await sendAndLog(lead.id, From, `We do not have any openings in the next week. A team member will call you to get you scheduled.`);
-        return res.status(200).send('<Response></Response>');
-      }
-      const next = available[0];
-      const offered = next.slots.slice(0, 3);
-      const dateLabel = formatDate(next.date);
-      const options = offered.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
-
-      appendToConversation(lead.id, 'system', JSON.stringify({
-        pendingSlots: offered.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
-        date: next.date,
-        businessId: business.id
-      }));
-
-      await sendAndLog(lead.id, From, `We are not available that day. The next opening is ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
-    } else {
-      const offered = slots.slice(0, 3);
-      const dateLabel = formatDate(targetDate);
-      const options = offered.map((s, i) => `${i + 1}) ${s.label}`).join(', ');
-
-      appendToConversation(lead.id, 'system', JSON.stringify({
-        pendingSlots: offered.map(s => ({ ...s, start: s.start.toISOString(), end: s.end.toISOString() })),
-        date: targetDate,
-        businessId: business.id
-      }));
-
-      await sendAndLog(lead.id, From, `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to confirm your spot.`);
-    }
-
+    const timePreference = intent.time_preference;
+    await showSlotsForDate(lead, business, targetDate, timePreference, From);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 8: Claude handles everything else
+  // PRIORITY 9: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
