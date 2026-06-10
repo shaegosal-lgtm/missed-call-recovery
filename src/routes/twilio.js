@@ -55,7 +55,6 @@ function parseDayFromText(day) {
   return getNextWeekday(new Date(today.setDate(today.getDate() + 1)));
 }
 
-// Send SMS and log it to the conversation at the same time
 async function sendAndLog(leadId, to, message) {
   await sendSMS(to, message);
   if (leadId) appendToConversation(leadId, 'assistant', message);
@@ -158,7 +157,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     try {
       pendingData = JSON.parse(recentSystem.body);
     } catch {
-      await sendAndLog(lead.id, From, `Something went wrong. Please tell us what day you would like to come in.`);
+      await sendAndLog(lead.id, From, `Something went wrong. What day would you like to come in?`);
       return res.status(200).send('<Response></Response>');
     }
 
@@ -174,9 +173,9 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     const result = bookAppointment(businessId, lead.id, chosen.start);
 
     if (!result.success) {
-      await sendAndLog(lead.id, From, `Sorry, that slot was just taken. What other day works for you?`);
+      await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
     } else {
-      const confirmMsg = `Booked! Your appointment is confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. Reply CANCEL anytime to cancel.`;
+      const confirmMsg = `You are all set! Your appointment is confirmed for ${chosen.label}. Your confirmation code is ${result.confirmationCode}. Reply CANCEL anytime if you need to cancel.`;
       await sendAndLog(lead.id, From, confirmMsg);
       await notifyOwner({
         ...lead,
@@ -200,10 +199,10 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (text.toUpperCase() === 'CANCEL') {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
-      await sendAndLog(lead.id, From, `We don't have an active appointment on file for your number.`);
+      await sendAndLog(lead.id, From, `We do not have an active appointment on file for your number.`);
     } else {
       cancelAppointment(appt.id);
-      await sendAndLog(lead.id, From, `Your appointment has been cancelled. Text us anytime to rebook.`);
+      await sendAndLog(lead.id, From, `Your appointment has been cancelled. Feel free to text us anytime to rebook.`);
     }
     return res.status(200).send('<Response></Response>');
   }
@@ -233,11 +232,22 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     if (!business) {
-      await sendAndLog(lead.id, From, `A team member will reach out shortly to schedule your appointment.`);
+      await sendAndLog(lead.id, From, `A team member will reach out shortly to get you scheduled.`);
       return res.status(200).send('<Response></Response>');
     }
 
-    const targetDate = parseDayFromText(intent.preferred_day);
+    // Use specific date if provided, otherwise use day name
+    let targetDate = null;
+    if (intent.preferred_date) {
+      targetDate = getNextWeekday(new Date(intent.preferred_date));
+    } else if (intent.preferred_day) {
+      targetDate = parseDayFromText(intent.preferred_day);
+    } else {
+      // No date yet — ask for it
+      await sendAndLog(lead.id, From, `What day works best for you?`);
+      return res.status(200).send('<Response></Response>');
+    }
+
     let slots = getAvailableSlots(business.id, targetDate);
 
     if (intent.time_preference === 'morning') {
@@ -251,7 +261,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (slots.length === 0) {
       const available = getNextAvailableDays(business.id, 7);
       if (available.length === 0) {
-        await sendAndLog(lead.id, From, `We don't have any openings in the next week. A team member will call you to schedule.`);
+        await sendAndLog(lead.id, From, `We do not have any openings in the next week. A team member will call you to get you scheduled.`);
         return res.status(200).send('<Response></Response>');
       }
       const next = available[0];
@@ -265,8 +275,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         businessId: business.id
       }));
 
-      const msg = `We are next available on ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`;
-      await sendAndLog(lead.id, From, msg);
+      await sendAndLog(lead.id, From, `We are not available on that day. The next available is ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
     } else {
       const offered = slots.slice(0, 3);
       const dateLabel = formatDate(targetDate);
@@ -278,8 +287,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         businessId: business.id
       }));
 
-      const msg = `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to book your spot.`;
-      await sendAndLog(lead.id, From, msg);
+      await sendAndLog(lead.id, From, `On ${dateLabel} we have: ${options}. Reply 1, 2, or 3 to confirm your spot.`);
     }
 
     return res.status(200).send('<Response></Response>');
