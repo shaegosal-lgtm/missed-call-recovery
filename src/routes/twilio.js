@@ -175,8 +175,10 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (!result.success) {
       await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
     } else {
-      const confirmMsg = `You are all set! Your appointment is confirmed for ${chosen.label}. Your confirmation code is ${result.confirmationCode}. Reply CANCEL anytime if you need to cancel.`;
+      // Now collect name after booking confirmed
+      const confirmMsg = `You are all set! Your appointment is confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. Reply CANCEL anytime to cancel. May I get your name for our records?`;
       await sendAndLog(lead.id, From, confirmMsg);
+      updateLead(lead.id, { status: 'scheduled' });
       await notifyOwner({
         ...lead,
         ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
@@ -207,7 +209,28 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 3: Analyze intent
+  // PRIORITY 3: First message — customer just gave their reason
+  // Acknowledge and ask if they want to book — no Claude needed
+  if (!lead.reason && text.length > 3) {
+    updateLead(lead.id, { reason: text });
+
+    // Run classification in background
+    classifyLead(From, text)
+      .then(result => {
+        updateLead(lead.id, {
+          urgency: result.urgency,
+          lead_type: result.lead_type,
+          ai_summary: result.summary,
+        });
+        notifyOwner({ ...lead, reason: text, ...result });
+      })
+      .catch(err => console.error('Classification failed:', err));
+
+    await sendAndLog(lead.id, From, `Got it, thank you for letting us know. Would you like to book an appointment?`);
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 4: Analyze intent
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -224,7 +247,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lead.name = intent.name;
   }
 
-  // PRIORITY 4: Booking flow
+  // PRIORITY 5: Booking flow
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -275,7 +298,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         businessId: business.id
       }));
 
-      await sendAndLog(lead.id, From, `We are not available on that day. The next available is ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
+      await sendAndLog(lead.id, From, `We are not available that day. The next opening is ${dateLabel}: ${options}. Reply 1, 2, or 3 to confirm.`);
     } else {
       const offered = slots.slice(0, 3);
       const dateLabel = formatDate(targetDate);
@@ -293,7 +316,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 5: Claude handles general conversation
+  // PRIORITY 6: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
@@ -302,21 +325,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   );
 
   await sendAndLog(lead.id, From, reply);
-
-  // Save reason if not set yet
-  if (!lead.reason && text.length > 10) {
-    updateLead(lead.id, { reason: text });
-    classifyLead(From, text)
-      .then(result => {
-        updateLead(lead.id, {
-          urgency: result.urgency,
-          lead_type: result.lead_type,
-          ai_summary: result.summary,
-        });
-        notifyOwner({ ...lead, ...result });
-      })
-      .catch(err => console.error('Classification failed:', err));
-  }
 
   res.status(200).send('<Response></Response>');
 });
