@@ -503,7 +503,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (intent.preferred_date) {
       targetDate = getNextWeekday(new Date(intent.preferred_date));
     } else if (intent.preferred_day) {
-      const isNextWeek = text.toLowerCase().includes('next ' + intent.preferred_day);
+      const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
       targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
     } else {
       await sendAndLog(lead.id, From, `What day works best for you?`);

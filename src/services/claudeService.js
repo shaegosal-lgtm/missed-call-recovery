@@ -88,7 +88,13 @@ Your reply (one short natural message, no emojis):`;
 }
 
 async function analyzeIntent(message, conversationHistory) {
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const dayName = today.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+
   const prompt = `Analyze this SMS message from a customer contacting a business after a missed call.
+
+Today is ${dayName}, ${todayStr}.
 
 Message: "${message}"
 Recent conversation: ${JSON.stringify(conversationHistory.slice(-6))}
@@ -101,18 +107,20 @@ Return ONLY this JSON with no explanation or markdown:
   "selecting_slot": true or false,
   "slot_number": 1 or 2 or 3 or null,
   "preferred_day": "monday/tuesday/wednesday/thursday/friday/saturday/sunday/tomorrow/today or null",
-  "preferred_date": "YYYY-MM-DD or null if no specific date mentioned",
+  "preferred_date": "YYYY-MM-DD or null",
   "time_preference": "morning/afternoon/evening or null",
   "is_wrong_number": true or false,
   "has_name": true or false,
-  "name": "extracted name or null"
+  "name": "extracted name or null",
+  "is_next_week": true or false
 }
 
-Notes:
-- wants_to_book = true if customer mentions any day, date, time preference, or wanting to come in or schedule or book
-- selecting_slot = true if message is 1, 2, or 3 AND slots were recently offered in conversation
-- For preferred_date: convert specific dates like "June 1st", "the 15th", "next Monday" to YYYY-MM-DD format using current year 2026
-- preferred_day is for general day names only (monday, tuesday etc), preferred_date is for specific calendar dates`;
+IMPORTANT DATE RULES:
+- If message says "next [day]" (e.g. "next tuesday"), set is_next_week: true and preferred_day to the day name. Do NOT calculate the date yourself.
+- If message says just "[day]" without "next" (e.g. "tuesday"), set is_next_week: false and preferred_day to the day name.
+- Only set preferred_date for specific calendar dates like "June 23rd", "the 23rd", not for day names.
+- wants_to_book = true if customer mentions any day, date, time, or wanting to schedule.
+- selecting_slot = true if message is 1, 2, or 3 AND slots were recently offered in conversation.`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
@@ -134,7 +142,8 @@ Notes:
       time_preference: null,
       is_wrong_number: false,
       has_name: false,
-      name: null
+      name: null,
+      is_next_week: false
     };
   }
 }
