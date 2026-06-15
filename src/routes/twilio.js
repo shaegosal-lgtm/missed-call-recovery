@@ -336,7 +336,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   }
 
   // PRIORITY 2: CANCEL keyword
-  if (text.toUpperCase() === 'CANCEL') {
+if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel my appointment') || text.toLowerCase().includes('cancel appointment')) {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
       await sendAndLog(lead.id, From, `We do not have an active appointment on file for your number.`);
