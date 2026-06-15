@@ -40,10 +40,8 @@ async function getReceptionistResponse(business, lead, conversationHistory, cust
 
   const alreadySaidFollowUp = filteredHistory.toLowerCase().includes('team member') ||
     filteredHistory.toLowerCase().includes('follow up') ||
-    filteredHistory.toLowerCase().includes('get back to you');
-
-  const hasName = !!lead.name;
-  const hasReason = !!lead.reason;
+    filteredHistory.toLowerCase().includes('get back to you') ||
+    filteredHistory.toLowerCase().includes('be in touch');
 
   const systemPrompt = `You are a professional receptionist for ${business.name} following up on a missed call via SMS.
 
@@ -52,39 +50,30 @@ ${businessInfo}
 
 WHAT YOU KNOW ABOUT THIS CUSTOMER:
 - Phone: ${lead.phone} (never ask for this)
-- Name: ${hasName ? lead.name : 'not yet collected'}
-- Reason for calling: ${hasReason ? lead.reason : 'not yet collected'}
-
-YOUR GOAL: Collect their name and reason if missing, then move them toward booking an appointment.
-
-CONVERSATION FLOW:
-1. If you don't have their name — ask for it
-2. If you have their name but not their reason — ask what you can help them with
-3. If you have both — ask what day works best for them to come in
-4. Never ask multiple questions at once
-
-HOW TO HANDLE QUESTIONS YOU CANNOT ANSWER:
-- If the business info above answers it — answer it
-- If it does NOT answer it — say "I'll have someone from our team reach out to you about that" ONCE and move on
-- ${alreadySaidFollowUp ? 'You have ALREADY told them someone will reach out. Do NOT say it again. Instead move forward and ask what day works for an appointment.' : 'You may say this once if needed.'}
+- Name: ${lead.name || 'not yet collected'}
+- Reason for calling: ${lead.reason || 'not yet collected'}
 
 RULES:
 1. No emojis. Professional and warm tone.
 2. Under 160 characters per message.
 3. One question per message only.
 4. Never mention specific times or available slots — the booking system handles that.
-5. If they want to book, ask "What day works best for you?"
-6. Never ask for their phone number — you have it.
-7. Never repeat yourself.
-8. Never use bullet points or lists.
-9. Speak naturally — like a real receptionist, not a robot.
+5. Never ask for their phone number — you have it.
+6. Never repeat yourself.
+7. Never use bullet points or lists.
+8. Speak naturally — like a real receptionist, not a robot.
+9. For anything not in the business information above, say "I will have someone from our team reach out to you about that" — but only say this ONCE. ${alreadySaidFollowUp ? 'You have already said this. Do NOT say it again.' : ''}
+10. Never ask for a name unless the customer has already confirmed a booking.
+11. If the customer declines to book or just wants information, end the conversation warmly. Say something like "No problem, a team member will be in touch shortly" and do not ask for anything else.
+12. If the business information answers their question — answer it directly.
+13. If the customer wants to book — ask "What day works best for you?" and nothing else about times.
 
 CONVERSATION SO FAR:
 ${filteredHistory}
 
 Customer: "${customerMessage}"
 
-Your reply (one short natural message):`;
+Your reply (one short natural message, no emojis):`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
@@ -117,7 +106,7 @@ Return ONLY this JSON with no explanation or markdown:
 }
 
 Notes:
-- wants_to_book = true if customer mentions any day, date, time preference, or wanting to come in/schedule/book
+- wants_to_book = true if customer mentions any day, date, time preference, or wanting to come in or schedule or book
 - selecting_slot = true if message is 1, 2, or 3 AND slots were recently offered in conversation
 - For preferred_date: convert specific dates like "June 1st", "the 15th", "next Monday" to YYYY-MM-DD format using current year 2026
 - preferred_day is for general day names only (monday, tuesday etc), preferred_date is for specific calendar dates`;
