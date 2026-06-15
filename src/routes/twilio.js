@@ -424,15 +424,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 6: First message — but check for date/day first
+  // PRIORITY 6: First message — save as reason
   if (!lead.reason) {
-    // If message contains a date or day, go straight to booking flow
     if (containsDateOrDay(text) && business) {
       const parsedDate = parseDateFromMessage(text);
-      console.log('parsedDate debug:', parsedDate, 'isNext:', text.toLowerCase().includes('next '));
       const timePreference = getTimePreferenceFromText(text);
 
-      // Save reason as the full message
       updateLead(lead.id, { reason: text });
       classifyLead(From, text)
         .then(result => {
@@ -451,7 +448,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       }
     }
 
-    // Normal first message — save as reason and ask about booking
     if (text.length > 3) {
       updateLead(lead.id, { reason: text });
 
@@ -502,10 +498,20 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await showSlotsForDate(lead, business, parsedDate, timePreference, From);
       return res.status(200).send('<Response></Response>');
     }
-    // No date found — fall through to Claude
   }
 
-  // PRIORITY 10: Analyze intent with Claude
+  // PRIORITY 10: Any message containing a day/date — show slots immediately
+  if (business && containsDateOrDay(text)) {
+    const parsedDate = parseDateFromMessage(text);
+    const timePreference = getTimePreferenceFromText(text);
+
+    if (parsedDate) {
+      await showSlotsForDate(lead, business, parsedDate, timePreference, From);
+      return res.status(200).send('<Response></Response>');
+    }
+  }
+
+  // PRIORITY 11: Analyze intent with Claude
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -524,7 +530,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 11: Booking flow from intent
+  // PRIORITY 12: Booking flow from intent
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -542,13 +548,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
       targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
     } else {
-      const parsedDate = parseDateFromMessage(text);
-      if (parsedDate) {
-        targetDate = parsedDate;
-      } else {
-        await sendAndLog(lead.id, From, `What day works best for you?`);
-        return res.status(200).send('<Response></Response>');
-      }
+      await sendAndLog(lead.id, From, `What day works best for you?`);
+      return res.status(200).send('<Response></Response>');
     }
 
     const timePreference = intent.time_preference || getTimePreferenceFromText(text);
@@ -556,7 +557,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 12: Claude handles everything else
+  // PRIORITY 13: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
