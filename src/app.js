@@ -37,6 +37,8 @@ function runMigrations() {
     `ALTER TABLE businesses ADD COLUMN business_phone TEXT`,
     `ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`,
     `ALTER TABLE businesses ADD COLUMN business_info TEXT`,
+    `ALTER TABLE appointments ADD COLUMN service_address TEXT`,
+    `ALTER TABLE appointments ADD COLUMN address_confirmed INTEGER DEFAULT 0`,
     `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       business_id TEXT REFERENCES businesses(id),

@@ -65,7 +65,6 @@ function parseDateFromMessage(text) {
     'thursday': 4, 'friday': 5, 'saturday': 6
   };
 
-  // Check for day names
   for (const [dayName, dayNum] of Object.entries(days)) {
     if (t.includes(dayName)) {
       let daysAhead = dayNum - todayDay;
@@ -93,7 +92,6 @@ function parseDateFromMessage(text) {
     return monday.toISOString().split('T')[0];
   }
 
-  // Check for specific dates like "June 1st", "June 1", "the 15th"
   const months = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4,
     'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -138,6 +136,29 @@ function isYes(text) {
 function isNo(text) {
   const t = text.toLowerCase().trim();
   return ['no', 'nope', 'nah', 'not now', 'no thanks', 'no thank you'].includes(t);
+}
+
+function looksLikeAddress(text) {
+  // Check if text looks like a street address
+  return /\d+\s+\w+/.test(text) || 
+    text.toLowerCase().includes('street') ||
+    text.toLowerCase().includes('avenue') ||
+    text.toLowerCase().includes('ave') ||
+    text.toLowerCase().includes('road') ||
+    text.toLowerCase().includes('rd') ||
+    text.toLowerCase().includes('drive') ||
+    text.toLowerCase().includes('dr') ||
+    text.toLowerCase().includes('blvd') ||
+    text.toLowerCase().includes('lane') ||
+    text.toLowerCase().includes('court');
+}
+
+function wantsToWaitForCall(text) {
+  const t = text.toLowerCase();
+  return t.includes('call') || t.includes('when you call') || 
+    t.includes('prefer') || t.includes('later') || 
+    t.includes('then') || t.includes('when someone') ||
+    t.includes('wait') || t.includes('phone call');
 }
 
 async function showSlotsForDate(lead, business, targetDate, timePreference, From) {
@@ -292,7 +313,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (!result.success) {
       await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
     } else {
-      const confirmMsg = `You are all set! Your appointment is confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. Reply CANCEL anytime to cancel. May I get your name for our records?`;
+      // Booking confirmed — ask for address
+      const confirmMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To send our technician, could you provide your service address? Or if you prefer, our team will confirm it when they call to remind you.`;
       await sendAndLog(lead.id, From, confirmMsg);
       updateLead(lead.id, { status: 'scheduled' });
       await notifyOwner({
@@ -325,7 +347,45 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 3: First message — customer just gave their reason
+  // PRIORITY 3: Check if we are waiting for address response
+  const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
+  const waitingForAddress = lastAssistantMsg &&
+    lastAssistantMsg.body.toLowerCase().includes('service address');
+
+  if (waitingForAddress) {
+    const appt = getAppointmentByPhone(From);
+
+    if (wantsToWaitForCall(text) || isNo(text)) {
+      // Customer prefers to give address on call
+      if (appt) {
+        db.prepare('UPDATE appointments SET address_confirmed = 0 WHERE id = ?').run(appt.id);
+      }
+      await sendAndLog(lead.id, From, `No problem at all. Our team will confirm the address when they call. We look forward to seeing you!`);
+      return res.status(200).send('<Response></Response>');
+    }
+
+    if (looksLikeAddress(text) || text.length > 10) {
+      // Customer gave an address
+      if (appt) {
+        db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
+          .run(text, appt.id);
+      }
+      await sendAndLog(lead.id, From, `Perfect, thank you! We have your address on file. We look forward to seeing you. Reply CANCEL anytime if you need to cancel.`);
+      return res.status(200).send('<Response></Response>');
+    }
+  }
+
+  // PRIORITY 4: Check if waiting for name after booking
+  const waitingForName = lastAssistantMsg &&
+    lastAssistantMsg.body.toLowerCase().includes('your name');
+
+  if (waitingForName && text.length > 1 && text.length < 40) {
+    updateLead(lead.id, { name: text });
+    await sendAndLog(lead.id, From, `Thank you ${text}! We look forward to seeing you.`);
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 5: First message — customer just gave their reason
   if (!lead.reason && text.length > 3) {
     updateLead(lead.id, { reason: text });
 
@@ -344,29 +404,29 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // Check last assistant message
-  const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
+  // Check last assistant message context
   const lastMsgWasBookingQuestion = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('book an appointment');
   const lastMsgWasDayQuestion = lastAssistantMsg && (
     lastAssistantMsg.body.toLowerCase().includes('what day works') ||
     lastAssistantMsg.body.toLowerCase().includes('what day would') ||
-    lastAssistantMsg.body.toLowerCase().includes('what other day')
+    lastAssistantMsg.body.toLowerCase().includes('what other day') ||
+    lastAssistantMsg.body.toLowerCase().includes('specific day')
   );
 
-  // PRIORITY 4: Customer said yes to booking
+  // PRIORITY 6: Customer said yes to booking
   if (lastMsgWasBookingQuestion && isYes(text)) {
     await sendAndLog(lead.id, From, `What day works best for you?`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 5: Customer said no to booking
+  // PRIORITY 7: Customer said no to booking
   if (lastMsgWasBookingQuestion && isNo(text)) {
     await sendAndLog(lead.id, From, `No problem. A team member will be in touch with you shortly.`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 6: Last message was asking for a day — treat reply as day selection
+  // PRIORITY 8: Last message was asking for a day
   if (lastMsgWasDayQuestion && business) {
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
@@ -375,13 +435,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await showSlotsForDate(lead, business, parsedDate, timePreference, From);
       return res.status(200).send('<Response></Response>');
     } else {
-      // Couldn't parse a date — ask again more specifically
       await sendAndLog(lead.id, From, `Could you let us know a specific day, like Monday or Tuesday?`);
       return res.status(200).send('<Response></Response>');
     }
   }
 
-  // PRIORITY 7: Analyze intent with Claude
+  // PRIORITY 9: Analyze intent with Claude
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -392,15 +451,15 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   console.log('Intent:', JSON.stringify(intent));
 
-  // Extract name if detected and lead is already scheduled
-  if (intent.has_name && intent.name && !lead.name) {
+  // Extract name if detected and lead is scheduled
+  if (intent.has_name && intent.name && !lead.name && lead.status === 'scheduled') {
     updateLead(lead.id, { name: intent.name });
     lead.name = intent.name;
     await sendAndLog(lead.id, From, `Thank you ${intent.name}! We look forward to seeing you.`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 8: Booking flow from intent
+  // PRIORITY 10: Booking flow from intent
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -427,7 +486,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 9: Claude handles everything else
+  // PRIORITY 11: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,

@@ -54,14 +54,12 @@ router.get('/login', (req, res) => {
 router.post('/login', async (req, res) => {
   const { username, password } = req.body;
 
-  // Check for admin login
   if (username === 'admin' && password === process.env.ADMIN_KEY) {
     req.session.role = 'admin';
     req.session.authenticated = true;
     return res.redirect('/dashboard');
   }
 
-  // Check for business user login
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (user) {
     const valid = await bcrypt.compare(password, user.password_hash);
@@ -81,7 +79,6 @@ router.get('/logout', (req, res) => {
   res.redirect('/dashboard/login');
 });
 
-// Main dashboard — admin sees all businesses, business user sees their own
 router.get('/', requireAuth, (req, res) => {
   if (req.session.role === 'admin') {
     const businesses = db.prepare('SELECT * FROM businesses ORDER BY created_at DESC').all();
@@ -116,18 +113,14 @@ router.get('/', requireAuth, (req, res) => {
 
     return res.send(renderPage('Admin Dashboard', `
       <h2>Businesses</h2>
-      ${businesses.length === 0
-        ? '<div class="empty">No businesses yet.</div>'
-        : businessCards}
+      ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : businessCards}
     `, 'admin'));
   }
 
-  // Business user — redirect to their business page
   res.redirect(`/dashboard/business/${req.session.businessId}`);
 });
 
 router.get('/business/:id', requireAuth, (req, res) => {
-  // Business users can only see their own data
   if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
     return res.redirect('/dashboard');
   }
@@ -170,11 +163,11 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <td>${new Date(a.start_time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</td>
       <td><span class="badge">${a.status}</span></td>
       <td>${a.confirmation_code || '-'}</td>
+      <td>${a.service_address || '<span style="color:#999">Pending</span>'}</td>
     </tr>
   `).join('');
 
   const leadData = JSON.stringify(leads).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
-
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
 
   return res.send(renderPage(business.name, `
@@ -204,7 +197,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <table>
         <thead>
           <tr>
-            <th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Status</th><th>Code</th>
+            <th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Status</th><th>Code</th><th>Address</th>
           </tr>
         </thead>
         <tbody>${apptRows}</tbody>
@@ -270,7 +263,6 @@ function renderPage(title, content, role) {
       body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #111; }
       .nav { background: white; padding: 16px 24px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
       .nav-title { font-size: 18px; font-weight: 600; }
-      .nav-right { display: flex; gap: 16px; align-items: center; }
       .nav a { color: #666; font-size: 14px; text-decoration: none; }
       .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
       .back { color: #666; font-size: 14px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
@@ -314,9 +306,7 @@ function renderPage(title, content, role) {
   <body>
     <div class="nav">
       <div class="nav-title">Missed Call Recovery</div>
-      <div class="nav-right">
-        <a href="/dashboard/logout">Sign out</a>
-      </div>
+      <a href="/dashboard/logout">Sign out</a>
     </div>
     <div class="container">
       ${content}
