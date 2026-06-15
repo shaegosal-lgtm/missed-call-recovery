@@ -24,7 +24,7 @@ function getNextWeekday(date) {
   return d.toISOString().split('T')[0];
 }
 
-function parseDayFromText(day) {
+function parseDayFromText(day, isNextWeek = false) {
   if (!day) return null;
   const today = new Date();
   const todayDay = today.getDay();
@@ -47,6 +47,7 @@ function parseDayFromText(day) {
   if (days[day] !== undefined) {
     let daysAhead = days[day] - todayDay;
     if (daysAhead <= 0) daysAhead += 7;
+    if (isNextWeek) daysAhead += 7;
     const target = new Date(today);
     target.setDate(today.getDate() + daysAhead);
     return getNextWeekday(target);
@@ -502,13 +503,14 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (intent.preferred_date) {
       targetDate = getNextWeekday(new Date(intent.preferred_date));
     } else if (intent.preferred_day) {
-      targetDate = parseDayFromText(intent.preferred_day);
+      const isNextWeek = text.toLowerCase().includes('next ' + intent.preferred_day);
+      targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
     } else {
       await sendAndLog(lead.id, From, `What day works best for you?`);
       return res.status(200).send('<Response></Response>');
     }
 
-    const timePreference = intent.time_preference;
+    const timePreference = intent.time_preference || getTimePreferenceFromText(text);
     await showSlotsForDate(lead, business, targetDate, timePreference, From);
     return res.status(200).send('<Response></Response>');
   }
