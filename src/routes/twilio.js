@@ -500,11 +500,19 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     let targetDate = null;
-    if (intent.preferred_date) {
-      targetDate = getNextWeekday(new Date(intent.preferred_date));
+    
+    // First try parsing specific dates from the original text (June 23rd, etc)
+    const specificDate = parseDateFromMessage(text);
+    
+    if (specificDate && intent.preferred_day) {
+      // We have both — use is_next_week to determine which week
+      const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
+      targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
     } else if (intent.preferred_day) {
       const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
       targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
+    } else if (specificDate) {
+      targetDate = specificDate;
     } else {
       await sendAndLog(lead.id, From, `What day works best for you?`);
       return res.status(200).send('<Response></Response>');
