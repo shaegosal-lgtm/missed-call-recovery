@@ -160,6 +160,25 @@ function wantsToWaitForCall(text) {
     t.includes('wait') || t.includes('phone call');
 }
 
+function looksLikeCancel(text) {
+  const t = text.toLowerCase();
+  return t === 'cancel' ||
+    t.includes('cancel my appointment') ||
+    t.includes('cancel appointment') ||
+    t.includes('want to cancel') ||
+    t.includes('need to cancel') ||
+    t.includes('like to cancel');
+}
+
+function looksLikeReschedule(text) {
+  const t = text.toLowerCase();
+  return t.includes('reschedule') ||
+    t.includes('change my appointment') ||
+    t.includes('move my appointment') ||
+    t.includes('different time') ||
+    t.includes('different day');
+}
+
 async function showSlotsForDate(lead, business, targetDate, timePreference, From) {
   let slots = getAvailableSlots(business.id, targetDate);
 
@@ -333,8 +352,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 2: CANCEL keyword
-  if (text.toUpperCase() === 'CANCEL' || text.toLowerCase().includes('cancel my appointment') || text.toLowerCase().includes('cancel appointment')) {
+  // PRIORITY 2: Cancel keywords
+  if (looksLikeCancel(text)) {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
       await sendAndLog(lead.id, From, `We do not have an active appointment on file for your number.`);
@@ -345,7 +364,19 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 3: Check if waiting for address response
+  // PRIORITY 3: Reschedule keywords
+  if (looksLikeReschedule(text)) {
+    const appt = getAppointmentByPhone(From);
+    if (!appt) {
+      await sendAndLog(lead.id, From, `We do not have an active appointment on file for your number. Would you like to book one?`);
+    } else {
+      cancelAppointment(appt.id);
+      await sendAndLog(lead.id, From, `No problem. Your current appointment has been cancelled. What day works best for the new appointment?`);
+    }
+    return res.status(200).send('<Response></Response>');
+  }
+
+  // PRIORITY 4: Check if waiting for address response
   const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
   const waitingForAddress = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('service address');
@@ -371,7 +402,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
   }
 
-  // PRIORITY 4: Check if waiting for name after booking
+  // PRIORITY 5: Check if waiting for name after booking
   const waitingForName = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('your name');
 
@@ -381,7 +412,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 5: First message — customer just gave their reason
+  // PRIORITY 6: First message — customer just gave their reason
   if (!lead.reason && text.length > 3) {
     updateLead(lead.id, { reason: text });
 
@@ -410,19 +441,19 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lastAssistantMsg.body.toLowerCase().includes('specific day')
   );
 
-  // PRIORITY 6: Customer said yes to booking
+  // PRIORITY 7: Customer said yes to booking
   if (lastMsgWasBookingQuestion && isYes(text)) {
     await sendAndLog(lead.id, From, `What day works best for you?`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 7: Customer said no to booking
+  // PRIORITY 8: Customer said no to booking
   if (lastMsgWasBookingQuestion && isNo(text)) {
     await sendAndLog(lead.id, From, `No problem. A team member will be in touch with you shortly.`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 8: Last message was asking for a day — only handle if text looks like a date
+  // PRIORITY 9: Last message was asking for a day — only handle if text looks like a date
   if (lastMsgWasDayQuestion && business) {
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
@@ -431,10 +462,10 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await showSlotsForDate(lead, business, parsedDate, timePreference, From);
       return res.status(200).send('<Response></Response>');
     }
-    // No date found — fall through to Claude to handle naturally
+    // No date found — fall through to Claude
   }
 
-  // PRIORITY 9: Analyze intent with Claude
+  // PRIORITY 10: Analyze intent with Claude
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -453,7 +484,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 10: Booking flow from intent
+  // PRIORITY 11: Booking flow from intent
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -480,7 +511,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 11: Claude handles everything else
+  // PRIORITY 12: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
