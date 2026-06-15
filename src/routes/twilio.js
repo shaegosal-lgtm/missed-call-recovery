@@ -139,8 +139,7 @@ function isNo(text) {
 }
 
 function looksLikeAddress(text) {
-  // Check if text looks like a street address
-  return /\d+\s+\w+/.test(text) || 
+  return /\d+\s+\w+/.test(text) ||
     text.toLowerCase().includes('street') ||
     text.toLowerCase().includes('avenue') ||
     text.toLowerCase().includes('ave') ||
@@ -155,8 +154,8 @@ function looksLikeAddress(text) {
 
 function wantsToWaitForCall(text) {
   const t = text.toLowerCase();
-  return t.includes('call') || t.includes('when you call') || 
-    t.includes('prefer') || t.includes('later') || 
+  return t.includes('call') || t.includes('when you call') ||
+    t.includes('prefer') || t.includes('later') ||
     t.includes('then') || t.includes('when someone') ||
     t.includes('wait') || t.includes('phone call');
 }
@@ -313,8 +312,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     if (!result.success) {
       await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
     } else {
-      // Booking confirmed — ask for address
-      const confirmMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To send our technician, could you provide your service address? Or if you prefer, our team will confirm it when they call to remind you.`;
+      const confirmMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To send our technician, could you provide your service address? Or if you prefer, our team will confirm it when they call.`;
       await sendAndLog(lead.id, From, confirmMsg);
       updateLead(lead.id, { status: 'scheduled' });
       await notifyOwner({
@@ -336,7 +334,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   }
 
   // PRIORITY 2: CANCEL keyword
-if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel my appointment') || text.toLowerCase().includes('cancel appointment')) {
+  if (text.toUpperCase() === 'CANCEL' || text.toLowerCase().includes('cancel my appointment') || text.toLowerCase().includes('cancel appointment')) {
     const appt = getAppointmentByPhone(From);
     if (!appt) {
       await sendAndLog(lead.id, From, `We do not have an active appointment on file for your number.`);
@@ -347,7 +345,7 @@ if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 3: Check if we are waiting for address response
+  // PRIORITY 3: Check if waiting for address response
   const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
   const waitingForAddress = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('service address');
@@ -356,7 +354,6 @@ if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel
     const appt = getAppointmentByPhone(From);
 
     if (wantsToWaitForCall(text) || isNo(text)) {
-      // Customer prefers to give address on call
       if (appt) {
         db.prepare('UPDATE appointments SET address_confirmed = 0 WHERE id = ?').run(appt.id);
       }
@@ -365,7 +362,6 @@ if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel
     }
 
     if (looksLikeAddress(text) || text.length > 10) {
-      // Customer gave an address
       if (appt) {
         db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
           .run(text, appt.id);
@@ -426,7 +422,7 @@ if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 8: Last message was asking for a day
+  // PRIORITY 8: Last message was asking for a day — only handle if text looks like a date
   if (lastMsgWasDayQuestion && business) {
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
@@ -434,10 +430,8 @@ if (text.toUpperCase().includes('CANCEL') || text.toLowerCase().includes('cancel
     if (parsedDate) {
       await showSlotsForDate(lead, business, parsedDate, timePreference, From);
       return res.status(200).send('<Response></Response>');
-    } else {
-      await sendAndLog(lead.id, From, `Could you let us know a specific day, like Monday or Tuesday?`);
-      return res.status(200).send('<Response></Response>');
     }
+    // No date found — fall through to Claude to handle naturally
   }
 
   // PRIORITY 9: Analyze intent with Claude
