@@ -182,6 +182,15 @@ function looksLikeReschedule(text) {
     t.includes('different day');
 }
 
+function containsDateOrDay(text) {
+  const t = text.toLowerCase();
+  const dayWords = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sunday', 'tomorrow', 'today', 'next week'];
+  const monthWords = ['january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december'];
+  return dayWords.some(d => t.includes(d)) || monthWords.some(m => t.includes(m));
+}
+
 async function showSlotsForDate(lead, business, targetDate, timePreference, From) {
   let slots = getAvailableSlots(business.id, targetDate);
 
@@ -415,23 +424,50 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 6: First message — customer just gave their reason
-  if (!lead.reason && text.length > 3) {
-    updateLead(lead.id, { reason: text });
+  // PRIORITY 6: First message — but check for date/day first
+  if (!lead.reason) {
+    // If message contains a date or day, go straight to booking flow
+    if (containsDateOrDay(text) && business) {
+      const parsedDate = parseDateFromMessage(text);
+      const timePreference = getTimePreferenceFromText(text);
 
-    classifyLead(From, text)
-      .then(result => {
-        updateLead(lead.id, {
-          urgency: result.urgency,
-          lead_type: result.lead_type,
-          ai_summary: result.summary,
-        });
-        notifyOwner({ ...lead, reason: text, ...result });
-      })
-      .catch(err => console.error('Classification failed:', err));
+      // Save reason as the full message
+      updateLead(lead.id, { reason: text });
+      classifyLead(From, text)
+        .then(result => {
+          updateLead(lead.id, {
+            urgency: result.urgency,
+            lead_type: result.lead_type,
+            ai_summary: result.summary,
+          });
+          notifyOwner({ ...lead, reason: text, ...result });
+        })
+        .catch(err => console.error('Classification failed:', err));
 
-    await sendAndLog(lead.id, From, `Got it, thank you for letting us know. Would you like to book an appointment?`);
-    return res.status(200).send('<Response></Response>');
+      if (parsedDate) {
+        await showSlotsForDate(lead, business, parsedDate, timePreference, From);
+        return res.status(200).send('<Response></Response>');
+      }
+    }
+
+    // Normal first message — save as reason and ask about booking
+    if (text.length > 3) {
+      updateLead(lead.id, { reason: text });
+
+      classifyLead(From, text)
+        .then(result => {
+          updateLead(lead.id, {
+            urgency: result.urgency,
+            lead_type: result.lead_type,
+            ai_summary: result.summary,
+          });
+          notifyOwner({ ...lead, reason: text, ...result });
+        })
+        .catch(err => console.error('Classification failed:', err));
+
+      await sendAndLog(lead.id, From, `Got it, thank you for letting us know. Would you like to book an appointment?`);
+      return res.status(200).send('<Response></Response>');
+    }
   }
 
   // Check last assistant message context
@@ -500,22 +536,18 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     let targetDate = null;
-    
-    // First try parsing specific dates from the original text (June 23rd, etc)
-    const specificDate = parseDateFromMessage(text);
-    
-    if (specificDate && intent.preferred_day) {
-      // We have both — use is_next_week to determine which week
+
+    if (intent.preferred_day) {
       const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
       targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
-    } else if (intent.preferred_day) {
-      const isNextWeek = intent.is_next_week || text.toLowerCase().includes('next ' + intent.preferred_day);
-      targetDate = parseDayFromText(intent.preferred_day, isNextWeek);
-    } else if (specificDate) {
-      targetDate = specificDate;
     } else {
-      await sendAndLog(lead.id, From, `What day works best for you?`);
-      return res.status(200).send('<Response></Response>');
+      const parsedDate = parseDateFromMessage(text);
+      if (parsedDate) {
+        targetDate = parsedDate;
+      } else {
+        await sendAndLog(lead.id, From, `What day works best for you?`);
+        return res.status(200).send('<Response></Response>');
+      }
     }
 
     const timePreference = intent.time_preference || getTimePreferenceFromText(text);
