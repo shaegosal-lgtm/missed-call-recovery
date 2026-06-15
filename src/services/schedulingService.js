@@ -1,11 +1,25 @@
 const db = require('../db/db');
 const { v4: uuidv4 } = require('uuid');
 
+function getLocalHour(date, timezone) {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      hour12: false,
+    });
+    return parseInt(formatter.format(date));
+  } catch {
+    return date.getHours();
+  }
+}
+
 function getAvailableSlots(businessId, date) {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(businessId);
   if (!business) throw new Error('Business not found');
 
   const duration = business.appointment_duration_mins;
+  const timezone = business.timezone || 'America/Toronto';
 
   const d = new Date(date + 'T12:00:00Z');
   const dayOfWeek = d.getUTCDay();
@@ -25,7 +39,6 @@ function getAvailableSlots(businessId, date) {
   const closeMinutes = closeH * 60 + closeM;
 
   let currentMinutes = openMinutes;
-  let slotIndex = 0;
 
   while (currentMinutes + duration <= closeMinutes) {
     const slotHour = Math.floor(currentMinutes / 60);
@@ -38,7 +51,6 @@ function getAvailableSlots(businessId, date) {
     startDate.setUTCMilliseconds(0);
 
     const endDate = new Date(startDate.getTime() + duration * 60000);
-
     const label = formatHour(slotHour, slotMin);
 
     slots.push({
@@ -46,12 +58,12 @@ function getAvailableSlots(businessId, date) {
       end: endDate,
       label,
       slotHour,
-      slotIndex,
     });
 
     currentMinutes += duration;
-    slotIndex++;
   }
+
+  const now = new Date();
 
   const bookedSlots = db.prepare(`
     SELECT start_time, end_time FROM appointments
@@ -69,6 +81,10 @@ function getAvailableSlots(businessId, date) {
   const unavailable = [...bookedSlots, ...blockedSlots];
 
   return slots.filter(slot => {
+    // Filter out slots in the past
+    if (slot.start <= now) return false;
+
+    // Filter out booked/blocked slots
     return !unavailable.some(u => {
       const uStart = new Date(u.start_time);
       const uEnd = new Date(u.end_time);
@@ -81,7 +97,7 @@ function getNextAvailableDays(businessId, daysAhead = 7) {
   const results = [];
   const today = new Date();
 
-  for (let i = 1; i <= daysAhead; i++) {
+  for (let i = 0; i <= daysAhead; i++) {
     const date = new Date(today);
     date.setDate(today.getDate() + i);
     const dateStr = date.toISOString().split('T')[0];
