@@ -59,6 +59,7 @@ function parseDateFromMessage(text) {
   const t = text.toLowerCase().trim();
   const today = new Date();
   const todayDay = today.getDay();
+  const isNextWeek = t.includes('next ');
 
   const days = {
     'sunday': 0, 'monday': 1, 'tuesday': 2, 'wednesday': 3,
@@ -69,6 +70,7 @@ function parseDateFromMessage(text) {
     if (t.includes(dayName)) {
       let daysAhead = dayNum - todayDay;
       if (daysAhead <= 0) daysAhead += 7;
+      if (isNextWeek) daysAhead += 7;
       const target = new Date(today);
       target.setDate(today.getDate() + daysAhead);
       return getNextWeekday(target);
@@ -453,7 +455,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 9: Last message was asking for a day — only handle if text looks like a date
+  // PRIORITY 9: Last message was asking for a day
   if (lastMsgWasDayQuestion && business) {
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
