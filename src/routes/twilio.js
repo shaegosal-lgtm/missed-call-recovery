@@ -429,6 +429,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     // If message contains a date or day, go straight to booking flow
     if (containsDateOrDay(text) && business) {
       const parsedDate = parseDateFromMessage(text);
+      console.log('parsedDate debug:', parsedDate, 'isNext:', text.toLowerCase().includes('next '));
       const timePreference = getTimePreferenceFromText(text);
 
       // Save reason as the full message
