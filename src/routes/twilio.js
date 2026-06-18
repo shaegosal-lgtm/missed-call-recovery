@@ -6,6 +6,7 @@ const { sendSMS } = require('../services/twilioService');
 const { classifyLead, getReceptionistResponse, analyzeIntent } = require('../services/claudeService');
 const { createLead, getLeadByPhone, updateLead, appendToConversation } = require('../services/leadService');
 const { notifyOwner } = require('../services/notifyService');
+const { sendLeadNotification } = require('../services/emailService');
 const twilioAuth = require('../middleware/twilioAuth');
 const {
   getAvailableSlots,
@@ -346,10 +347,14 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       const confirmMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To send our technician, could you provide your service address? Or if you prefer, our team will confirm it when they call.`;
       await sendAndLog(lead.id, From, confirmMsg);
       updateLead(lead.id, { status: 'scheduled' });
-      await notifyOwner({
-        ...lead,
-        ai_summary: `Appointment booked for ${chosen.label}. Code: ${result.confirmationCode}`
-      });
+
+      const apptDetails = `${chosen.label} — Confirmation Code: ${result.confirmationCode}`;
+      await notifyOwner({ ...lead, ai_summary: apptDetails });
+      await sendLeadNotification(
+        business || { name: 'the business' },
+        { ...lead, ai_summary: apptDetails },
+        apptDetails
+      );
 
       if (lead.reason) {
         classifyLead(From, lead.reason)
@@ -385,7 +390,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       cancelAppointment(appt.id);
       await sendAndLog(lead.id, From, `No problem. Your current appointment has been cancelled. What day works best for the new appointment?`);
     }
-    return res.status(200).send('<Response></Response>');
+    return res.status(200).send('<Response></Replace>');
   }
 
   // PRIORITY 4: Check if waiting for address response
@@ -439,6 +444,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
             ai_summary: result.summary,
           });
           notifyOwner({ ...lead, reason: text, ...result });
+          sendLeadNotification(business || { name: 'the business' }, { ...lead, reason: text, ...result });
         })
         .catch(err => console.error('Classification failed:', err));
 
@@ -459,6 +465,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
             ai_summary: result.summary,
           });
           notifyOwner({ ...lead, reason: text, ...result });
+          sendLeadNotification(business || { name: 'the business' }, { ...lead, reason: text, ...result });
         })
         .catch(err => console.error('Classification failed:', err));
 
@@ -500,7 +507,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
   }
 
-  // PRIORITY 10: Any message containing a day/date — show slots immediately
+  // PRIORITY 10: Any message containing a day/date
   if (business && containsDateOrDay(text)) {
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);

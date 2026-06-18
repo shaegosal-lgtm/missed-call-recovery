@@ -39,6 +39,7 @@ function runMigrations() {
     `ALTER TABLE businesses ADD COLUMN business_info TEXT`,
     `ALTER TABLE appointments ADD COLUMN service_address TEXT`,
     `ALTER TABLE appointments ADD COLUMN address_confirmed INTEGER DEFAULT 0`,
+    `ALTER TABLE businesses ADD COLUMN owner_email TEXT`,
     `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       business_id TEXT REFERENCES businesses(id),
@@ -52,7 +53,7 @@ function runMigrations() {
   migrations.forEach(sql => {
     try {
       db.exec(sql);
-      console.log('Migration applied:', sql);
+      console.log('Migration applied:', sql.substring(0, 50));
     } catch (e) {
       // Already exists — skip silently
     }
