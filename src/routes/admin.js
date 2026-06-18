@@ -15,7 +15,7 @@ function adminAuth(req, res, next) {
 // Create a new business
 router.post('/businesses', adminAuth, (req, res) => {
   const {
-    name, ownerPhone, twilioNumber, businessPhone,
+    name, ownerPhone, ownerEmail, twilioNumber, businessPhone,
     timezone, durationMins, businessInfo, openTime, closeTime, workDays
   } = req.body;
 
@@ -32,9 +32,9 @@ router.post('/businesses', adminAuth, (req, res) => {
     const id = uuidv4();
     db.prepare(`
       INSERT INTO businesses 
-      (id, name, owner_phone, twilio_number, business_phone, timezone, appointment_duration_mins, business_info)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, name, ownerPhone, twilioNumber, businessPhone || null,
+      (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, name, ownerPhone, ownerEmail || null, twilioNumber, businessPhone || null,
       timezone || 'America/Toronto', durationMins || 60, businessInfo || null);
 
     const days = workDays || [1, 2, 3, 4, 5];
@@ -70,7 +70,7 @@ router.get('/businesses/:id', adminAuth, (req, res) => {
 // Update business
 router.patch('/businesses/:id', adminAuth, (req, res) => {
   const {
-    name, ownerPhone, businessPhone, timezone,
+    name, ownerPhone, ownerEmail, businessPhone, timezone,
     durationMins, businessInfo, openTime, closeTime, workDays
   } = req.body;
 
@@ -81,12 +81,13 @@ router.patch('/businesses/:id', adminAuth, (req, res) => {
     UPDATE businesses SET
       name = COALESCE(?, name),
       owner_phone = COALESCE(?, owner_phone),
+      owner_email = COALESCE(?, owner_email),
       business_phone = COALESCE(?, business_phone),
       timezone = COALESCE(?, timezone),
       appointment_duration_mins = COALESCE(?, appointment_duration_mins),
       business_info = COALESCE(?, business_info)
     WHERE id = ?
-  `).run(name, ownerPhone, businessPhone, timezone, durationMins, businessInfo, req.params.id);
+  `).run(name, ownerPhone, ownerEmail, businessPhone, timezone, durationMins, businessInfo, req.params.id);
 
   if (openTime || closeTime || workDays) {
     db.prepare('DELETE FROM business_hours WHERE business_id = ?').run(req.params.id);
@@ -177,37 +178,6 @@ router.get('/businesses/:id/appointments', adminAuth, (req, res) => {
     ORDER BY a.start_time ASC
   `).all(req.params.id);
   res.json(appointments);
-});
-
-// Setup endpoint (kept for convenience)
-router.post('/setup-business', (req, res) => {
-  const { name, ownerPhone, twilioNumber, timezone, durationMins } = req.body;
-  try {
-    const id = uuidv4();
-    db.prepare(`INSERT INTO businesses (id, name, owner_phone, timezone, appointment_duration_mins, twilio_number) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(id, name || 'My Business', ownerPhone, timezone || 'America/Toronto', durationMins || 60, twilioNumber);
-
-    const days = [1, 2, 3, 4, 5];
-    days.forEach(day => {
-      db.prepare(`INSERT INTO business_hours (id, business_id, day_of_week, open_time, close_time, is_open) VALUES (?, ?, ?, ?, ?, 1)`)
-        .run(uuidv4(), id, day, '09:00', '17:00');
-    });
-
-    res.json({ success: true, businessId: id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Update business phone endpoint
-router.post('/update-business-phone', (req, res) => {
-  const { twilioNumber, businessPhone } = req.body;
-  try {
-    db.exec('ALTER TABLE businesses ADD COLUMN IF NOT EXISTS business_phone TEXT');
-  } catch (e) {}
-  db.prepare('UPDATE businesses SET business_phone = ? WHERE twilio_number = ?')
-    .run(businessPhone, twilioNumber);
-  res.json({ success: true });
 });
 
 module.exports = router;
