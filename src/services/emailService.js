@@ -100,7 +100,7 @@ async function sendLeadNotification(business, lead, appointmentDetails = null) {
 
   try {
     await resend.emails.send({
-      from: 'MissedPro <notifications@missedpro.com>',
+      from: 'MissedPro <onboarding@resend.dev>',
       to: business.owner_email,
       subject,
       html,
