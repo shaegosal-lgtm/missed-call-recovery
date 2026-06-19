@@ -41,6 +41,7 @@ function runMigrations() {
     `ALTER TABLE appointments ADD COLUMN address_confirmed INTEGER DEFAULT 0`,
     `ALTER TABLE businesses ADD COLUMN owner_email TEXT`,
     `ALTER TABLE businesses ADD COLUMN avg_job_value REAL DEFAULT 150`,
+    `ALTER TABLE leads ADD COLUMN viewed INTEGER DEFAULT 0`,
     `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       business_id TEXT REFERENCES businesses(id),

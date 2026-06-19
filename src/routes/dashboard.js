@@ -91,6 +91,12 @@ router.get('/logout', (req, res) => {
   res.redirect('/dashboard/login');
 });
 
+// Mark a lead as viewed
+router.post('/api/leads/:id/view', requireAuth, (req, res) => {
+  db.prepare('UPDATE leads SET viewed = 1 WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
 router.get('/', requireAuth, (req, res) => {
   if (req.session.role === 'admin') {
     const businesses = db.prepare('SELECT * FROM businesses ORDER BY created_at DESC').all();
@@ -208,8 +214,10 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const leadCards = leads.map(l => {
     const u = urgencyStyle[l.urgency] || urgencyStyle.unknown;
     const s = statusStyle[l.status] || statusStyle.new;
+    const isNew = !l.viewed;
     return `
-    <div class="lead-row" onclick="showLead('${l.id}')">
+    <div class="lead-row ${isNew ? 'is-new' : ''}" onclick="showLead('${l.id}')" data-lead-id="${l.id}">
+      ${isNew ? '<div class="new-dot"></div>' : ''}
       <div class="lead-avatar">${initials(l.name, l.phone)}</div>
       <div class="lead-main">
         <div class="lead-name-line">
@@ -220,14 +228,13 @@ router.get('/business/:id', requireAuth, (req, res) => {
         <div class="lead-summary">${l.ai_summary || l.reason || 'No summary yet'}</div>
       </div>
       <div class="lead-tags">
-        <span class="tag" style="background:${u.bg};color:${u.text}">${l.urgency}</span>
-        <span class="tag" style="background:${s.bg};color:${s.text}">${l.status}</span>
+        <span class="tag-lg urgency-${l.urgency}">${l.urgency}</span>
+        <span class="tag-lg status-${l.status}">${l.status}</span>
       </div>
     </div>
   `}).join('');
 
   const apptCards = appointments.map(a => {
-    const s = statusStyle[a.status] || statusStyle.new;
     const startDate = new Date(a.start_time);
     return `
     <div class="appt-row">
@@ -238,7 +245,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <div class="appt-main">
         <div class="appt-name-line">
           <span class="appt-name">${a.lead_name || 'Unknown'}</span>
-          <span class="tag" style="background:${s.bg};color:${s.text}">${a.status}</span>
+          <span class="tag-lg status-${a.status}">${a.status}</span>
         </div>
         <div class="appt-detail">${startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })} · ${a.phone}</div>
         ${a.service_address ? `<div class="appt-address">📍 ${a.service_address}</div>` : '<div class="appt-address muted">📍 Address pending</div>'}
@@ -372,7 +379,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
         btn.classList.add('active');
       }
 
-      function showLead(id) {
+      async function showLead(id) {
         const lead = leads.find(l => l.id === id);
         if (!lead) return;
 
@@ -395,6 +402,17 @@ router.get('/business/:id', requireAuth, (req, res) => {
           '<div class="field"><div class="field-label">Conversation</div><div class="convo">' + (convoHtml || 'No messages yet') + '</div></div>';
 
         document.getElementById('modal').classList.add('active');
+
+        // Mark as viewed
+        const row = document.querySelector('[data-lead-id="' + id + '"]');
+        if (row && row.classList.contains('is-new')) {
+          row.classList.remove('is-new');
+          const dot = row.querySelector('.new-dot');
+          if (dot) dot.remove();
+          try {
+            await fetch('/dashboard/api/leads/' + id + '/view', { method: 'POST' });
+          } catch(e) {}
+        }
       }
 
       function closeModal() {
@@ -496,35 +514,48 @@ function renderPage(title, content, role) {
 
       /* LEAD LIST */
       .lead-list { display: flex; flex-direction: column; }
-      .lead-row { display: flex; align-items: flex-start; gap: 14px; padding: 16px 20px; border-bottom: 1px solid var(--gray-100); cursor: pointer; transition: background 0.15s; }
+      .lead-row { display: flex; align-items: flex-start; gap: 14px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); cursor: pointer; transition: background 0.15s; position: relative; }
       .lead-row:last-child { border-bottom: none; }
       .lead-row:hover { background: var(--gray-50); }
-      .lead-avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--blue-light); color: var(--blue); font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+      .lead-row.is-new { background: var(--blue-light); }
+      .lead-row.is-new:hover { background: #DCE9FC; }
+      .new-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); flex-shrink: 0; margin-top: 16px; }
+      .lead-avatar { width: 44px; height: 44px; border-radius: 50%; background: var(--navy); color: white; font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
       .lead-main { flex: 1; min-width: 0; }
       .lead-name-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-      .lead-name { font-size: 15px; font-weight: 700; color: var(--navy); }
+      .lead-name { font-size: 16px; font-weight: 700; color: var(--navy); }
       .lead-date { font-size: 12px; color: var(--gray-500); white-space: nowrap; }
       .lead-phone { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
-      .lead-summary { font-size: 13px; color: var(--gray-700); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 480px; }
-      .lead-tags { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; }
-      .tag { font-size: 11px; padding: 3px 10px; border-radius: 100px; font-weight: 700; text-transform: capitalize; white-space: nowrap; }
+      .lead-summary { font-size: 14px; color: var(--gray-700); margin-top: 8px; line-height: 1.4; }
+      .lead-tags { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; flex-shrink: 0; }
+
+      /* BIGGER TAGS */
+      .tag-lg { font-size: 13px; padding: 6px 14px; border-radius: 8px; font-weight: 700; text-transform: capitalize; white-space: nowrap; min-width: 80px; text-align: center; }
+      .urgency-high { background: #DC2626; color: white; }
+      .urgency-medium { background: #F59E0B; color: white; }
+      .urgency-low { background: #16A34A; color: white; }
+      .urgency-unknown { background: var(--gray-300); color: white; }
+      .status-new { background: var(--blue); color: white; }
+      .status-scheduled { background: #16A34A; color: white; }
+      .status-closed { background: var(--gray-500); color: white; }
+      .status-cancelled { background: #DC2626; color: white; }
 
       /* APPT LIST */
       .appt-list { display: flex; flex-direction: column; }
-      .appt-row { display: flex; align-items: center; gap: 16px; padding: 16px 20px; border-bottom: 1px solid var(--gray-100); }
+      .appt-row { display: flex; align-items: center; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); }
       .appt-row:last-child { border-bottom: none; }
-      .appt-date-block { width: 52px; height: 52px; border-radius: 10px; background: var(--navy); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
+      .appt-date-block { width: 56px; height: 56px; border-radius: 10px; background: var(--navy); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
       .appt-month { font-size: 10px; font-weight: 700; color: var(--sky); letter-spacing: 0.5px; }
-      .appt-day { font-size: 18px; font-weight: 800; line-height: 1; margin-top: 2px; }
+      .appt-day { font-size: 20px; font-weight: 800; line-height: 1; margin-top: 2px; }
       .appt-main { flex: 1; min-width: 0; }
       .appt-name-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-      .appt-name { font-size: 15px; font-weight: 700; color: var(--navy); }
-      .appt-detail { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
-      .appt-address { font-size: 13px; color: var(--gray-700); margin-top: 4px; }
+      .appt-name { font-size: 16px; font-weight: 700; color: var(--navy); }
+      .appt-detail { font-size: 13px; color: var(--gray-500); margin-top: 4px; }
+      .appt-address { font-size: 13px; color: var(--gray-700); margin-top: 6px; }
       .appt-address.muted { color: var(--gray-300); }
       .appt-code { text-align: center; flex-shrink: 0; }
       .code-label { font-size: 10px; color: var(--gray-300); font-weight: 700; letter-spacing: 0.5px; }
-      .code-value { font-size: 13px; font-weight: 800; color: var(--blue); font-family: monospace; margin-top: 2px; }
+      .code-value { font-size: 14px; font-weight: 800; color: var(--blue); font-family: monospace; margin-top: 2px; }
 
       /* MODAL */
       .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
@@ -546,8 +577,8 @@ function renderPage(title, content, role) {
       @media (max-width: 768px) {
         .analytics-grid { grid-template-columns: repeat(2, 1fr); }
         .summary-grid { grid-template-columns: 1fr; }
-        .lead-summary { max-width: 200px; }
         .lead-name-line { flex-direction: column; align-items: flex-start; gap: 2px; }
+        .lead-tags { flex-direction: row; }
       }
     </style>
   </head>
