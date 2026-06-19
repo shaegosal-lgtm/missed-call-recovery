@@ -141,6 +141,37 @@ router.get('/business/:id', requireAuth, (req, res) => {
     ORDER BY a.start_time ASC
   `).all(business.id);
 
+  // ANALYTICS CALCULATIONS
+  const now = new Date();
+  const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+  const leadsThisMonth = leads.filter(l => l.created_at >= firstOfMonth.replace('T', ' ').substring(0, 19));
+  const apptsThisMonth = appointments.filter(a => a.created_at >= firstOfMonth.replace('T', ' ').substring(0, 19) && a.status !== 'cancelled');
+
+  const totalLeadsAllTime = leads.length;
+  const totalApptsAllTime = appointments.filter(a => a.status !== 'cancelled').length;
+  const conversionRate = totalLeadsAllTime > 0 ? Math.round((totalApptsAllTime / totalLeadsAllTime) * 100) : 0;
+  const avgJobValue = business.avg_job_value || 150;
+  const revenueRecoveredMonth = apptsThisMonth.length * avgJobValue;
+  const revenueRecoveredAllTime = totalApptsAllTime * avgJobValue;
+
+  const urgencyBreakdown = {
+    high: leads.filter(l => l.urgency === 'high').length,
+    medium: leads.filter(l => l.urgency === 'medium').length,
+    low: leads.filter(l => l.urgency === 'low').length,
+  };
+
+  // Last 7 days lead count for simple trend
+  const last7Days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dayStr = d.toISOString().split('T')[0];
+    const count = leads.filter(l => l.created_at.startsWith(dayStr)).length;
+    last7Days.push({ label: d.toLocaleDateString('en-US', { weekday: 'short' }), count });
+  }
+  const maxDayCount = Math.max(...last7Days.map(d => d.count), 1);
+
   const urgencyColor = { high: '#e53e3e', medium: '#d69e2e', low: '#38a169', unknown: '#999' };
 
   const leadRows = leads.map(l => `
@@ -170,39 +201,127 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const leadData = JSON.stringify(leads).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
 
+  const trendBars = last7Days.map(d => `
+    <div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;">
+      <div style="width:100%;max-width:32px;height:80px;display:flex;align-items:flex-end;">
+        <div style="width:100%;background:#1A6FDB;border-radius:4px 4px 0 0;height:${(d.count / maxDayCount) * 100}%;min-height:${d.count > 0 ? '4px' : '0'};"></div>
+      </div>
+      <div style="font-size:11px;color:#999;">${d.label}</div>
+      <div style="font-size:11px;color:#333;font-weight:600;">${d.count}</div>
+    </div>
+  `).join('');
+
   return res.send(renderPage(business.name, `
     ${backLink}
     <h2>${business.name}</h2>
     <div class="sub">${business.twilio_number} · ${business.timezone}</div>
 
-    <div class="section">
-      <div class="section-header">Leads (${leads.length})</div>
-      ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `
-      <div style="overflow-x:auto">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th><th>Phone</th><th>Urgency</th><th>Type</th><th>Status</th><th>Summary</th><th>Date</th>
-          </tr>
-        </thead>
-        <tbody>${leadRows}</tbody>
-      </table>
-      </div>`}
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
+      <button class="tab-btn" onclick="switchTab('leads', this)">Leads</button>
+      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments</button>
     </div>
 
-    <div class="section">
-      <div class="section-header">Appointments (${appointments.length})</div>
-      ${appointments.length === 0 ? '<div class="empty">No appointments yet</div>' : `
-      <div style="overflow-x:auto">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Status</th><th>Code</th><th>Address</th>
-          </tr>
-        </thead>
-        <tbody>${apptRows}</tbody>
-      </table>
-      </div>`}
+    <div id="tab-overview" class="tab-content active">
+      <div class="analytics-grid">
+        <div class="analytics-card">
+          <div class="analytics-label">Leads This Month</div>
+          <div class="analytics-value">${leadsThisMonth.length}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-label">Appointments Booked</div>
+          <div class="analytics-value">${apptsThisMonth.length}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-label">Conversion Rate</div>
+          <div class="analytics-value">${conversionRate}%</div>
+        </div>
+        <div class="analytics-card highlight">
+          <div class="analytics-label">Revenue Recovered (Month)</div>
+          <div class="analytics-value">$${revenueRecoveredMonth.toLocaleString()}</div>
+        </div>
+      </div>
+
+      <div class="section" style="margin-top:24px;">
+        <div class="section-header">Leads — Last 7 Days</div>
+        <div style="padding:24px;display:flex;gap:12px;align-items:flex-end;">
+          ${trendBars}
+        </div>
+      </div>
+
+      <div class="section" style="margin-top:24px;">
+        <div class="section-header">All-Time Summary</div>
+        <div style="padding:20px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px;">
+          <div>
+            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Leads</div>
+            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">${totalLeadsAllTime}</div>
+          </div>
+          <div>
+            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Appointments</div>
+            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">${totalApptsAllTime}</div>
+          </div>
+          <div>
+            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Revenue Recovered</div>
+            <div style="font-size:24px;font-weight:700;color:#16a34a;margin-top:4px;">$${revenueRecoveredAllTime.toLocaleString()}</div>
+          </div>
+          <div>
+            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Avg Job Value</div>
+            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">$${avgJobValue}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section" style="margin-top:24px;">
+        <div class="section-header">Lead Urgency Breakdown</div>
+        <div style="padding:20px;display:flex;gap:24px;">
+          <div style="text-align:center;">
+            <div style="width:48px;height:48px;border-radius:50%;background:#fee2e2;color:#e53e3e;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.high}</div>
+            <div style="font-size:12px;color:#999;margin-top:6px;">High</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="width:48px;height:48px;border-radius:50%;background:#fef3c7;color:#d69e2e;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.medium}</div>
+            <div style="font-size:12px;color:#999;margin-top:6px;">Medium</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="width:48px;height:48px;border-radius:50%;background:#dcfce7;color:#16a34a;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.low}</div>
+            <div style="font-size:12px;color:#999;margin-top:6px;">Low</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-leads" class="tab-content">
+      <div class="section">
+        <div class="section-header">Leads (${leads.length})</div>
+        ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `
+        <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>Phone</th><th>Urgency</th><th>Type</th><th>Status</th><th>Summary</th><th>Date</th>
+            </tr>
+          </thead>
+          <tbody>${leadRows}</tbody>
+        </table>
+        </div>`}
+      </div>
+    </div>
+
+    <div id="tab-appointments" class="tab-content">
+      <div class="section">
+        <div class="section-header">Appointments (${appointments.length})</div>
+        ${appointments.length === 0 ? '<div class="empty">No appointments yet</div>' : `
+        <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Status</th><th>Code</th><th>Address</th>
+            </tr>
+          </thead>
+          <tbody>${apptRows}</tbody>
+        </table>
+        </div>`}
+      </div>
     </div>
 
     <div class="modal" id="modal">
@@ -215,6 +334,13 @@ router.get('/business/:id', requireAuth, (req, res) => {
 
     <script>
       const leads = JSON.parse(\`${leadData}\`);
+
+      function switchTab(tabName, btn) {
+        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        document.getElementById('tab-' + tabName).classList.add('active');
+        btn.classList.add('active');
+      }
 
       function showLead(id) {
         const lead = leads.find(l => l.id === id);
@@ -301,6 +427,21 @@ function renderPage(title, content, role) {
       .field { margin-bottom: 12px; }
       .field-label { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
       .field-value { font-size: 14px; }
+      .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid #eee; }
+      .tab-btn { background: none; border: none; padding: 10px 16px; font-size: 14px; font-weight: 500; color: #666; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; }
+      .tab-btn.active { color: #111; border-bottom-color: #1A6FDB; }
+      .tab-content { display: none; }
+      .tab-content.active { display: block; }
+      .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+      .analytics-card { background: white; border-radius: 12px; border: 1px solid #eee; padding: 20px; }
+      .analytics-card.highlight { background: #0D1B2A; border-color: #0D1B2A; }
+      .analytics-card.highlight .analytics-label { color: rgba(255,255,255,0.6); }
+      .analytics-card.highlight .analytics-value { color: #4A9FFF; }
+      .analytics-label { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+      .analytics-value { font-size: 28px; font-weight: 700; color: #111; }
+      @media (max-width: 768px) {
+        .analytics-grid { grid-template-columns: repeat(2, 1fr); }
+      }
     </style>
   </head>
   <body>

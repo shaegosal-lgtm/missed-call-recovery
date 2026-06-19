@@ -16,7 +16,7 @@ function adminAuth(req, res, next) {
 router.post('/businesses', adminAuth, (req, res) => {
   const {
     name, ownerPhone, ownerEmail, twilioNumber, businessPhone,
-    timezone, durationMins, businessInfo, openTime, closeTime, workDays
+    timezone, durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue
   } = req.body;
 
   if (!name || !ownerPhone || !twilioNumber) {
@@ -32,10 +32,10 @@ router.post('/businesses', adminAuth, (req, res) => {
     const id = uuidv4();
     db.prepare(`
       INSERT INTO businesses 
-      (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info, avg_job_value)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, name, ownerPhone, ownerEmail || null, twilioNumber, businessPhone || null,
-      timezone || 'America/Toronto', durationMins || 60, businessInfo || null);
+      timezone || 'America/Toronto', durationMins || 60, businessInfo || null, avgJobValue || 150);
 
     const days = workDays || [1, 2, 3, 4, 5];
     const open = openTime || '09:00';
@@ -71,7 +71,7 @@ router.get('/businesses/:id', adminAuth, (req, res) => {
 router.patch('/businesses/:id', adminAuth, (req, res) => {
   const {
     name, ownerPhone, ownerEmail, businessPhone, timezone,
-    durationMins, businessInfo, openTime, closeTime, workDays
+    durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue
   } = req.body;
 
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
@@ -85,9 +85,10 @@ router.patch('/businesses/:id', adminAuth, (req, res) => {
       business_phone = COALESCE(?, business_phone),
       timezone = COALESCE(?, timezone),
       appointment_duration_mins = COALESCE(?, appointment_duration_mins),
-      business_info = COALESCE(?, business_info)
+      business_info = COALESCE(?, business_info),
+      avg_job_value = COALESCE(?, avg_job_value)
     WHERE id = ?
-  `).run(name, ownerPhone, ownerEmail, businessPhone, timezone, durationMins, businessInfo, req.params.id);
+  `).run(name, ownerPhone, ownerEmail, businessPhone, timezone, durationMins, businessInfo, avgJobValue, req.params.id);
 
   if (openTime || closeTime || workDays) {
     db.prepare('DELETE FROM business_hours WHERE business_id = ?').run(req.params.id);
