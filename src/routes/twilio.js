@@ -126,6 +126,12 @@ function getTimePreferenceFromText(text) {
   return null;
 }
 
+function isAnytimeResponse(text) {
+  const t = text.toLowerCase().trim();
+  return ['anytime', 'any time', 'whenever', 'any day', "doesn't matter",
+    'doesnt matter', 'no preference', 'flexible', 'asap', 'as soon as possible'].includes(t);
+}
+
 async function sendAndLog(leadId, to, message) {
   await sendSMS(to, message);
   if (leadId) appendToConversation(leadId, 'assistant', message);
@@ -330,51 +336,55 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    const { pendingSlots, businessId } = pendingData;
-    const index = parseInt(text.trim()) - 1;
-    const chosen = pendingSlots[index];
+    // Skip if this is a pendingConfirmation system message not a slot selection
+    if (pendingData.pendingConfirmation) {
+      // Fall through to other priorities
+    } else {
+      const { pendingSlots, businessId } = pendingData;
+      const index = parseInt(text.trim()) - 1;
+      const chosen = pendingSlots[index];
 
-    if (!chosen) {
-      await sendAndLog(lead.id, From, `Please reply with 1, 2, or 3 to select a time.`);
+      if (!chosen) {
+        await sendAndLog(lead.id, From, `Please reply with 1, 2, or 3 to select a time.`);
+        return res.status(200).send('<Response></Response>');
+      }
+
+      const result = bookAppointment(businessId, lead.id, chosen.start);
+
+      if (!result.success) {
+        await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
+      } else {
+        // Ask for address BEFORE confirming — store confirmation details in system message
+        updateLead(lead.id, { status: 'scheduled' });
+
+        appendToConversation(lead.id, 'system', JSON.stringify({
+          pendingConfirmation: true,
+          confirmationCode: result.confirmationCode,
+          slotLabel: chosen.label,
+          businessId: businessId
+        }));
+
+        await sendAndLog(lead.id, From, `Before we confirm your appointment for ${chosen.label}, we need your service address so our technician knows where to go. Could you provide that now, or would you prefer a team member calls you to confirm?`);
+
+        await notifyOwner({ ...lead, ai_summary: `Appointment pending for ${chosen.label}. Code: ${result.confirmationCode}` });
+        await sendLeadNotification(
+          business || { name: 'the business' },
+          { ...lead, ai_summary: `Appointment pending for ${chosen.label}` },
+          null
+        );
+
+        if (lead.reason) {
+          classifyLead(From, lead.reason)
+            .then(r => updateLead(lead.id, {
+              urgency: r.urgency,
+              lead_type: r.lead_type,
+              ai_summary: r.summary,
+            }))
+            .catch(err => console.error('Classification failed:', err));
+        }
+      }
       return res.status(200).send('<Response></Response>');
     }
-
-    const result = bookAppointment(businessId, lead.id, chosen.start);
-
-    if (!result.success) {
-      await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
-    } else {
-      // Booking confirmed - now ALWAYS collect name and address before considering complete
-      updateLead(lead.id, { status: 'scheduled' });
-
-      let nextMsg;
-      if (!lead.name) {
-        nextMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To finish setting up your appointment, may I get your name?`;
-      } else {
-        nextMsg = `You are all set! Appointment confirmed for ${chosen.label}. Confirmation code: ${result.confirmationCode}. To send our technician, could you provide your service address?`;
-      }
-
-      await sendAndLog(lead.id, From, nextMsg);
-
-      const apptDetails = `${chosen.label} — Confirmation Code: ${result.confirmationCode}`;
-      await notifyOwner({ ...lead, ai_summary: apptDetails });
-      await sendLeadNotification(
-        business || { name: 'the business' },
-        { ...lead, ai_summary: apptDetails },
-        apptDetails
-      );
-
-      if (lead.reason) {
-        classifyLead(From, lead.reason)
-          .then(r => updateLead(lead.id, {
-            urgency: r.urgency,
-            lead_type: r.lead_type,
-            ai_summary: r.summary,
-          }))
-          .catch(err => console.error('Classification failed:', err));
-      }
-    }
-    return res.status(200).send('<Response></Response>');
   }
 
   // PRIORITY 2: Cancel keywords
@@ -401,30 +411,41 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 4: Check if waiting for NAME (right after booking, before address)
+  // PRIORITY 4: Check if waiting for address (includes pending confirmation flow)
   const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
-  const waitingForNameAfterBooking = lastAssistantMsg &&
-    lastAssistantMsg.body.toLowerCase().includes('may i get your name');
-
-  if (waitingForNameAfterBooking && text.length > 1 && text.length < 40) {
-    updateLead(lead.id, { name: text });
-    await sendAndLog(lead.id, From, `Thank you ${text}! To send our technician, could you provide your service address?`);
-    return res.status(200).send('<Response></Response>');
-  }
-
-  // PRIORITY 5: Check if waiting for address response
-  const waitingForAddress = lastAssistantMsg &&
-    lastAssistantMsg.body.toLowerCase().includes('service address');
+  const waitingForAddress = lastAssistantMsg && (
+    lastAssistantMsg.body.toLowerCase().includes('service address') ||
+    lastAssistantMsg.body.toLowerCase().includes('address so our technician') ||
+    lastAssistantMsg.body.toLowerCase().includes('confirm your')
+  );
 
   if (waitingForAddress) {
     const appt = getAppointmentByPhone(From);
+
+    // Find pending confirmation details if any
+    const pendingConfirmMsg = [...convo].reverse().find(m => {
+      if (m.role !== 'system') return false;
+      try { return JSON.parse(m.body).pendingConfirmation; } catch { return false; }
+    });
+    let confirmCode = null;
+    let slotLabel = null;
+    if (pendingConfirmMsg) {
+      try {
+        const data = JSON.parse(pendingConfirmMsg.body);
+        confirmCode = data.confirmationCode;
+        slotLabel = data.slotLabel;
+      } catch {}
+    }
 
     if (wantsToWaitForCall(text) || isNo(text)) {
       if (appt) {
         db.prepare('UPDATE appointments SET address_confirmed = 0 WHERE id = ?').run(appt.id);
       }
       updateLead(lead.id, { status: 'needs_followup' });
-      await sendAndLog(lead.id, From, `No problem at all. A team member will call you to confirm the address before your appointment. We look forward to seeing you!`);
+      const msg = confirmCode
+        ? `No problem! Your appointment is confirmed for ${slotLabel}. Confirmation code: ${confirmCode}. A team member will call to confirm your address before the visit. Reply CANCEL anytime to cancel.`
+        : `No problem. A team member will call to confirm your address before the visit. We look forward to seeing you!`;
+      await sendAndLog(lead.id, From, msg);
       return res.status(200).send('<Response></Response>');
     }
 
@@ -434,16 +455,18 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
           .run(text, appt.id);
       }
       updateLead(lead.id, { status: 'scheduled' });
-      await sendAndLog(lead.id, From, `Perfect, thank you! We have your address on file. We look forward to seeing you. Reply CANCEL anytime if you need to cancel.`);
+      const msg = confirmCode
+        ? `You are all set! Your appointment is confirmed for ${slotLabel}. Confirmation code: ${confirmCode}. We have your address on file and will see you then. Reply CANCEL anytime to cancel.`
+        : `Perfect, thank you! We have your address on file. We look forward to seeing you. Reply CANCEL anytime to cancel.`;
+      await sendAndLog(lead.id, From, msg);
       return res.status(200).send('<Response></Response>');
     } else {
-      // Didn't look like a valid address - ask again, don't silently move on
-      await sendAndLog(lead.id, From, `Sorry, could you confirm the full address where our technician should come?`);
+      await sendAndLog(lead.id, From, `Could you confirm the full service address where our technician should come?`);
       return res.status(200).send('<Response></Response>');
     }
   }
 
-  // PRIORITY 6: First message — save as reason
+  // PRIORITY 5: First message — save as reason
   if (!lead.reason) {
     if (containsDateOrDay(text) && business) {
       const parsedDate = parseDateFromMessage(text);
@@ -498,21 +521,32 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lastAssistantMsg.body.toLowerCase().includes('specific day')
   );
 
-  // PRIORITY 7: Customer said yes to booking
+  // PRIORITY 6: Customer said yes to booking
   if (lastMsgWasBookingQuestion && isYes(text)) {
     await sendAndLog(lead.id, From, `What day works best for you?`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 8: Customer said no to booking
+  // PRIORITY 7: Customer said no to booking
   if (lastMsgWasBookingQuestion && isNo(text)) {
     updateLead(lead.id, { status: 'needs_followup' });
     await sendAndLog(lead.id, From, `No problem. A team member will be in touch with you shortly.`);
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 9: Last message was asking for a day
+  // PRIORITY 8: Last message was asking for a day
   if (lastMsgWasDayQuestion && business) {
+    if (isAnytimeResponse(text)) {
+      const available = getNextAvailableDays(business.id, 7);
+      if (available.length === 0) {
+        updateLead(lead.id, { status: 'needs_followup' });
+        await sendAndLog(lead.id, From, `We do not have any openings in the next week. A team member will call you to get you scheduled.`);
+        return res.status(200).send('<Response></Response>');
+      }
+      await showSlotsForDate(lead, business, available[0].date, null, From);
+      return res.status(200).send('<Response></Response>');
+    }
+
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
 
@@ -522,8 +556,19 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
   }
 
-  // PRIORITY 10: Any message containing a day/date
-  if (business && containsDateOrDay(text)) {
+  // PRIORITY 9: Any message containing a day/date or anytime
+  if (business && (containsDateOrDay(text) || isAnytimeResponse(text))) {
+    if (isAnytimeResponse(text)) {
+      const available = getNextAvailableDays(business.id, 7);
+      if (available.length === 0) {
+        updateLead(lead.id, { status: 'needs_followup' });
+        await sendAndLog(lead.id, From, `We do not have any openings in the next week. A team member will call you to get you scheduled.`);
+        return res.status(200).send('<Response></Response>');
+      }
+      await showSlotsForDate(lead, business, available[0].date, null, From);
+      return res.status(200).send('<Response></Response>');
+    }
+
     const parsedDate = parseDateFromMessage(text);
     const timePreference = getTimePreferenceFromText(text);
 
@@ -533,7 +578,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
   }
 
-  // PRIORITY 11: Analyze intent with Claude
+  // PRIORITY 10: Analyze intent with Claude
   let intent;
   try {
     intent = await analyzeIntent(text, convo);
@@ -544,15 +589,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   console.log('Intent:', JSON.stringify(intent));
 
-  // Extract name if detected and lead is scheduled but name missing
-  if (intent.has_name && intent.name && !lead.name && lead.status === 'scheduled') {
-    updateLead(lead.id, { name: intent.name });
-    lead.name = intent.name;
-    await sendAndLog(lead.id, From, `Thank you ${intent.name}! To send our technician, could you provide your service address?`);
-    return res.status(200).send('<Response></Response>');
-  }
-
-  // PRIORITY 12: Booking flow from intent
+  // PRIORITY 11: Booking flow from intent
   if (intent.wants_to_book || intent.wants_to_reschedule) {
     if (intent.wants_to_reschedule) {
       const appt = getAppointmentByPhone(From);
@@ -580,7 +617,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     return res.status(200).send('<Response></Response>');
   }
 
-  // PRIORITY 13: Claude handles everything else — if it can't help, flag for follow up
+  // PRIORITY 12: Claude handles everything else
   const reply = await getReceptionistResponse(
     business || { name: 'the business' },
     lead,
@@ -588,7 +625,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     text
   );
 
-  // If Claude is deferring to a team member, mark lead as needing follow up
   if (reply.toLowerCase().includes('team member') || reply.toLowerCase().includes('reach out')) {
     updateLead(lead.id, { status: 'needs_followup' });
   }
