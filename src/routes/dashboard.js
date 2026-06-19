@@ -22,20 +22,32 @@ router.get('/login', (req, res) => {
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
-        h1 { font-size: 22px; margin-bottom: 8px; color: #111; }
-        p { color: #666; font-size: 14px; margin-bottom: 24px; }
-        label { display: block; font-size: 13px; font-weight: 500; color: #333; margin-bottom: 6px; }
-        input { width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; margin-bottom: 16px; }
-        button { width: 100%; padding: 12px; background: #111; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer; }
-        button:hover { background: #333; }
+        :root {
+          --navy: #0D1B2A;
+          --blue: #1A6FDB;
+          --blue-light: #EBF3FF;
+          --sky: #4A9FFF;
+          --gray-50: #F8FAFC;
+          --gray-100: #F1F5F9;
+          --gray-300: #CBD5E1;
+          --gray-500: #64748B;
+          --gray-700: #334155;
+        }
+        body { font-family: -apple-system, sans-serif; background: var(--gray-50); display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 24px rgba(13,27,42,0.08); width: 100%; max-width: 400px; }
+        h1 { font-size: 22px; margin-bottom: 8px; color: var(--navy); font-weight: 800; letter-spacing: -0.5px; }
+        h1 span { color: var(--blue); }
+        p { color: var(--gray-500); font-size: 14px; margin-bottom: 24px; }
+        label { display: block; font-size: 13px; font-weight: 500; color: var(--gray-700); margin-bottom: 6px; }
+        input { width: 100%; padding: 10px 14px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 15px; margin-bottom: 16px; }
+        button { width: 100%; padding: 12px; background: var(--blue); color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; }
+        button:hover { background: #1560C0; }
         .error { color: #e53e3e; font-size: 13px; margin-bottom: 16px; background: #fff5f5; padding: 10px 12px; border-radius: 6px; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>Missed Call Recovery</h1>
+        <h1>Missed<span>Pro</span></h1>
         <p>Sign in to your dashboard</p>
         ${req.query.error ? '<p class="error">Invalid username or password. Please try again.</p>' : ''}
         <form method="POST" action="/dashboard/login">
@@ -95,17 +107,17 @@ router.get('/', requireAuth, (req, res) => {
       `).get(b.id).count;
 
       return `
-        <a href="/dashboard/business/${b.id}" class="card">
-          <div class="card-header">
+        <a href="/dashboard/business/${b.id}" class="biz-card">
+          <div class="biz-card-header">
             <div>
-              <div class="card-title">${b.name}</div>
-              <div class="card-sub">${b.twilio_number}</div>
+              <div class="biz-card-title">${b.name}</div>
+              <div class="biz-card-sub">${b.twilio_number}</div>
             </div>
-            <div class="badge">${leadCount} leads</div>
+            <div class="pill">${leadCount} leads</div>
           </div>
-          <div class="card-stats">
-            <div class="stat"><span class="stat-num">${leadCount}</span><span class="stat-label">Total Leads</span></div>
-            <div class="stat"><span class="stat-num">${apptCount}</span><span class="stat-label">Upcoming Appts</span></div>
+          <div class="biz-card-stats">
+            <div class="mini-stat"><span class="mini-stat-num">${leadCount}</span><span class="mini-stat-label">Total Leads</span></div>
+            <div class="mini-stat"><span class="mini-stat-num">${apptCount}</span><span class="mini-stat-label">Upcoming Appts</span></div>
           </div>
         </a>
       `;
@@ -113,7 +125,7 @@ router.get('/', requireAuth, (req, res) => {
 
     return res.send(renderPage('Admin Dashboard', `
       <h2>Businesses</h2>
-      ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : businessCards}
+      ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : `<div class="biz-grid">${businessCards}</div>`}
     `, 'admin'));
   }
 
@@ -161,7 +173,6 @@ router.get('/business/:id', requireAuth, (req, res) => {
     low: leads.filter(l => l.urgency === 'low').length,
   };
 
-  // Last 7 days lead count for simple trend
   const last7Days = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
@@ -172,42 +183,83 @@ router.get('/business/:id', requireAuth, (req, res) => {
   }
   const maxDayCount = Math.max(...last7Days.map(d => d.count), 1);
 
-  const urgencyColor = { high: '#e53e3e', medium: '#d69e2e', low: '#38a169', unknown: '#999' };
+  const urgencyStyle = {
+    high: { bg: '#FEE2E2', text: '#DC2626' },
+    medium: { bg: '#FEF3C7', text: '#D97706' },
+    low: { bg: '#DCFCE7', text: '#16A34A' },
+    unknown: { bg: '#F1F5F9', text: '#64748B' }
+  };
 
-  const leadRows = leads.map(l => `
-    <tr onclick="showLead('${l.id}')" style="cursor:pointer">
-      <td>${l.name || '<span style="color:#999">Unknown</span>'}</td>
-      <td>${l.phone}</td>
-      <td><span class="badge" style="background:${urgencyColor[l.urgency] || '#999'}20;color:${urgencyColor[l.urgency] || '#999'}">${l.urgency}</span></td>
-      <td>${l.lead_type}</td>
-      <td>${l.status}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.ai_summary || '-'}</td>
-      <td>${new Date(l.created_at).toLocaleDateString()}</td>
-    </tr>
-  `).join('');
+  const statusStyle = {
+    new: { bg: '#EBF3FF', text: '#1A6FDB' },
+    scheduled: { bg: '#DCFCE7', text: '#16A34A' },
+    closed: { bg: '#F1F5F9', text: '#64748B' },
+    cancelled: { bg: '#FEE2E2', text: '#DC2626' },
+  };
 
-  const apptRows = appointments.map(a => `
-    <tr>
-      <td>${a.lead_name || '-'}</td>
-      <td>${a.phone}</td>
-      <td>${new Date(a.start_time).toLocaleDateString()}</td>
-      <td>${new Date(a.start_time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</td>
-      <td><span class="badge">${a.status}</span></td>
-      <td>${a.confirmation_code || '-'}</td>
-      <td>${a.service_address || '<span style="color:#999">Pending</span>'}</td>
-    </tr>
-  `).join('');
+  function initials(name, phone) {
+    if (name) {
+      const parts = name.trim().split(' ');
+      return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
+    }
+    return phone.slice(-2);
+  }
+
+  const leadCards = leads.map(l => {
+    const u = urgencyStyle[l.urgency] || urgencyStyle.unknown;
+    const s = statusStyle[l.status] || statusStyle.new;
+    return `
+    <div class="lead-row" onclick="showLead('${l.id}')">
+      <div class="lead-avatar">${initials(l.name, l.phone)}</div>
+      <div class="lead-main">
+        <div class="lead-name-line">
+          <span class="lead-name">${l.name || 'Unknown Caller'}</span>
+          <span class="lead-date">${new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+        </div>
+        <div class="lead-phone">${l.phone}</div>
+        <div class="lead-summary">${l.ai_summary || l.reason || 'No summary yet'}</div>
+      </div>
+      <div class="lead-tags">
+        <span class="tag" style="background:${u.bg};color:${u.text}">${l.urgency}</span>
+        <span class="tag" style="background:${s.bg};color:${s.text}">${l.status}</span>
+      </div>
+    </div>
+  `}).join('');
+
+  const apptCards = appointments.map(a => {
+    const s = statusStyle[a.status] || statusStyle.new;
+    const startDate = new Date(a.start_time);
+    return `
+    <div class="appt-row">
+      <div class="appt-date-block">
+        <div class="appt-month">${startDate.toLocaleDateString('en-US', { month: 'short' }).toUpperCase()}</div>
+        <div class="appt-day">${startDate.getDate()}</div>
+      </div>
+      <div class="appt-main">
+        <div class="appt-name-line">
+          <span class="appt-name">${a.lead_name || 'Unknown'}</span>
+          <span class="tag" style="background:${s.bg};color:${s.text}">${a.status}</span>
+        </div>
+        <div class="appt-detail">${startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })} · ${a.phone}</div>
+        ${a.service_address ? `<div class="appt-address">📍 ${a.service_address}</div>` : '<div class="appt-address muted">📍 Address pending</div>'}
+      </div>
+      <div class="appt-code">
+        <div class="code-label">CODE</div>
+        <div class="code-value">${a.confirmation_code || '-'}</div>
+      </div>
+    </div>
+  `}).join('');
 
   const leadData = JSON.stringify(leads).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
 
   const trendBars = last7Days.map(d => `
-    <div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;">
-      <div style="width:100%;max-width:32px;height:80px;display:flex;align-items:flex-end;">
-        <div style="width:100%;background:#1A6FDB;border-radius:4px 4px 0 0;height:${(d.count / maxDayCount) * 100}%;min-height:${d.count > 0 ? '4px' : '0'};"></div>
+    <div class="trend-col">
+      <div class="trend-bar-wrap">
+        <div class="trend-bar" style="height:${(d.count / maxDayCount) * 100}%;${d.count === 0 ? 'min-height:0' : 'min-height:4px'}"></div>
       </div>
-      <div style="font-size:11px;color:#999;">${d.label}</div>
-      <div style="font-size:11px;color:#333;font-weight:600;">${d.count}</div>
+      <div class="trend-label">${d.label}</div>
+      <div class="trend-count">${d.count}</div>
     </div>
   `).join('');
 
@@ -218,8 +270,8 @@ router.get('/business/:id', requireAuth, (req, res) => {
 
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
-      <button class="tab-btn" onclick="switchTab('leads', this)">Leads</button>
-      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments</button>
+      <button class="tab-btn" onclick="switchTab('leads', this)">Leads <span class="tab-count">${leads.length}</span></button>
+      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${appointments.length}</span></button>
     </div>
 
     <div id="tab-overview" class="tab-content active">
@@ -242,49 +294,49 @@ router.get('/business/:id', requireAuth, (req, res) => {
         </div>
       </div>
 
-      <div class="section" style="margin-top:24px;">
+      <div class="section">
         <div class="section-header">Leads — Last 7 Days</div>
-        <div style="padding:24px;display:flex;gap:12px;align-items:flex-end;">
+        <div class="trend-chart">
           ${trendBars}
         </div>
       </div>
 
-      <div class="section" style="margin-top:24px;">
+      <div class="section">
         <div class="section-header">All-Time Summary</div>
-        <div style="padding:20px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px;">
-          <div>
-            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Leads</div>
-            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">${totalLeadsAllTime}</div>
+        <div class="summary-grid">
+          <div class="summary-item">
+            <div class="summary-label">Total Leads</div>
+            <div class="summary-value">${totalLeadsAllTime}</div>
           </div>
-          <div>
-            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Appointments</div>
-            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">${totalApptsAllTime}</div>
+          <div class="summary-item">
+            <div class="summary-label">Total Appointments</div>
+            <div class="summary-value">${totalApptsAllTime}</div>
           </div>
-          <div>
-            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Total Revenue Recovered</div>
-            <div style="font-size:24px;font-weight:700;color:#16a34a;margin-top:4px;">$${revenueRecoveredAllTime.toLocaleString()}</div>
+          <div class="summary-item">
+            <div class="summary-label">Total Revenue Recovered</div>
+            <div class="summary-value" style="color:#16A34A">$${revenueRecoveredAllTime.toLocaleString()}</div>
           </div>
-          <div>
-            <div style="font-size:12px;color:#999;text-transform:uppercase;letter-spacing:0.5px;">Avg Job Value</div>
-            <div style="font-size:24px;font-weight:700;color:#111;margin-top:4px;">$${avgJobValue}</div>
+          <div class="summary-item">
+            <div class="summary-label">Avg Job Value</div>
+            <div class="summary-value">$${avgJobValue}</div>
           </div>
         </div>
       </div>
 
-      <div class="section" style="margin-top:24px;">
+      <div class="section">
         <div class="section-header">Lead Urgency Breakdown</div>
-        <div style="padding:20px;display:flex;gap:24px;">
-          <div style="text-align:center;">
-            <div style="width:48px;height:48px;border-radius:50%;background:#fee2e2;color:#e53e3e;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.high}</div>
-            <div style="font-size:12px;color:#999;margin-top:6px;">High</div>
+        <div class="urgency-row">
+          <div class="urgency-item">
+            <div class="urgency-circle" style="background:#FEE2E2;color:#DC2626">${urgencyBreakdown.high}</div>
+            <div class="urgency-label">High</div>
           </div>
-          <div style="text-align:center;">
-            <div style="width:48px;height:48px;border-radius:50%;background:#fef3c7;color:#d69e2e;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.medium}</div>
-            <div style="font-size:12px;color:#999;margin-top:6px;">Medium</div>
+          <div class="urgency-item">
+            <div class="urgency-circle" style="background:#FEF3C7;color:#D97706">${urgencyBreakdown.medium}</div>
+            <div class="urgency-label">Medium</div>
           </div>
-          <div style="text-align:center;">
-            <div style="width:48px;height:48px;border-radius:50%;background:#dcfce7;color:#16a34a;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;margin:0 auto;">${urgencyBreakdown.low}</div>
-            <div style="font-size:12px;color:#999;margin-top:6px;">Low</div>
+          <div class="urgency-item">
+            <div class="urgency-circle" style="background:#DCFCE7;color:#16A34A">${urgencyBreakdown.low}</div>
+            <div class="urgency-label">Low</div>
           </div>
         </div>
       </div>
@@ -292,35 +344,13 @@ router.get('/business/:id', requireAuth, (req, res) => {
 
     <div id="tab-leads" class="tab-content">
       <div class="section">
-        <div class="section-header">Leads (${leads.length})</div>
-        ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `
-        <div style="overflow-x:auto">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th><th>Phone</th><th>Urgency</th><th>Type</th><th>Status</th><th>Summary</th><th>Date</th>
-            </tr>
-          </thead>
-          <tbody>${leadRows}</tbody>
-        </table>
-        </div>`}
+        ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `<div class="lead-list">${leadCards}</div>`}
       </div>
     </div>
 
     <div id="tab-appointments" class="tab-content">
       <div class="section">
-        <div class="section-header">Appointments (${appointments.length})</div>
-        ${appointments.length === 0 ? '<div class="empty">No appointments yet</div>' : `
-        <div style="overflow-x:auto">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Status</th><th>Code</th><th>Address</th>
-            </tr>
-          </thead>
-          <tbody>${apptRows}</tbody>
-        </table>
-        </div>`}
+        ${appointments.length === 0 ? '<div class="empty">No appointments yet</div>' : `<div class="appt-list">${apptCards}</div>`}
       </div>
     </div>
 
@@ -386,67 +416,144 @@ function renderPage(title, content, role) {
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #111; }
-      .nav { background: white; padding: 16px 24px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
-      .nav-title { font-size: 18px; font-weight: 600; }
-      .nav a { color: #666; font-size: 14px; text-decoration: none; }
+      :root {
+        --navy: #0D1B2A;
+        --blue: #1A6FDB;
+        --blue-light: #EBF3FF;
+        --sky: #4A9FFF;
+        --gray-50: #F8FAFC;
+        --gray-100: #F1F5F9;
+        --gray-300: #CBD5E1;
+        --gray-500: #64748B;
+        --gray-700: #334155;
+      }
+      body { font-family: -apple-system, sans-serif; background: var(--gray-50); color: var(--navy); }
+      .nav { background: var(--navy); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+      .nav-title { font-size: 18px; font-weight: 800; color: white; letter-spacing: -0.5px; }
+      .nav-title span { color: var(--sky); }
+      .nav a { color: rgba(255,255,255,0.6); font-size: 14px; text-decoration: none; }
+      .nav a:hover { color: white; }
       .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
-      .back { color: #666; font-size: 14px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
-      h2 { font-size: 22px; margin-bottom: 4px; }
-      .sub { color: #666; font-size: 14px; margin-bottom: 24px; }
-      .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; text-decoration: none; color: inherit; display: block; border: 1px solid #eee; transition: box-shadow 0.2s; }
-      .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-      .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
-      .card-title { font-size: 16px; font-weight: 600; }
-      .card-sub { font-size: 13px; color: #666; margin-top: 2px; }
-      .card-stats { display: flex; gap: 24px; }
-      .stat { display: flex; flex-direction: column; }
-      .stat-num { font-size: 22px; font-weight: 600; }
-      .stat-label { font-size: 12px; color: #666; margin-top: 2px; }
-      .badge { font-size: 12px; padding: 3px 8px; border-radius: 20px; background: #f0f0f0; color: #333; }
-      .section { background: white; border-radius: 12px; border: 1px solid #eee; margin-bottom: 24px; overflow: hidden; }
-      .section-header { padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; font-size: 15px; }
-      table { width: 100%; border-collapse: collapse; }
-      th { padding: 10px 16px; text-align: left; font-size: 12px; color: #666; font-weight: 500; border-bottom: 1px solid #eee; background: #fafafa; white-space: nowrap; }
-      td { padding: 12px 16px; font-size: 14px; border-bottom: 1px solid #f5f5f5; }
-      tr:last-child td { border-bottom: none; }
-      tr:hover td { background: #fafafa; }
-      .empty { padding: 40px; text-align: center; color: #999; font-size: 14px; }
-      .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 100; align-items: center; justify-content: center; }
+      .back { color: var(--gray-500); font-size: 14px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
+      .back:hover { color: var(--blue); }
+      h2 { font-size: 22px; margin-bottom: 4px; font-weight: 800; letter-spacing: -0.5px; }
+      .sub { color: var(--gray-500); font-size: 14px; margin-bottom: 24px; }
+
+      .biz-grid { display: grid; gap: 16px; }
+      .biz-card { background: white; border-radius: 12px; padding: 20px; text-decoration: none; color: inherit; display: block; border: 1px solid var(--gray-100); transition: box-shadow 0.2s, transform 0.2s; }
+      .biz-card:hover { box-shadow: 0 4px 24px rgba(13,27,42,0.08); transform: translateY(-2px); }
+      .biz-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+      .biz-card-title { font-size: 16px; font-weight: 700; }
+      .biz-card-sub { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
+      .pill { font-size: 12px; padding: 4px 12px; border-radius: 100px; background: var(--blue-light); color: var(--blue); font-weight: 600; }
+      .biz-card-stats { display: flex; gap: 24px; }
+      .mini-stat { display: flex; flex-direction: column; }
+      .mini-stat-num { font-size: 22px; font-weight: 700; }
+      .mini-stat-label { font-size: 12px; color: var(--gray-500); margin-top: 2px; }
+
+      .empty { padding: 40px; text-align: center; color: var(--gray-500); font-size: 14px; }
+
+      /* TABS */
+      .tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--gray-100); }
+      .tab-btn { background: none; border: none; padding: 12px 18px; font-size: 14px; font-weight: 600; color: var(--gray-500); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; display: flex; align-items: center; gap: 6px; }
+      .tab-btn:hover { color: var(--navy); }
+      .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+      .tab-count { background: var(--gray-100); color: var(--gray-500); font-size: 11px; padding: 1px 7px; border-radius: 100px; font-weight: 700; }
+      .tab-btn.active .tab-count { background: var(--blue-light); color: var(--blue); }
+      .tab-content { display: none; }
+      .tab-content.active { display: block; }
+
+      /* ANALYTICS */
+      .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+      .analytics-card { background: white; border-radius: 12px; border: 1px solid var(--gray-100); padding: 20px; }
+      .analytics-card.highlight { background: var(--navy); border-color: var(--navy); }
+      .analytics-card.highlight .analytics-label { color: rgba(255,255,255,0.6); }
+      .analytics-card.highlight .analytics-value { color: var(--sky); }
+      .analytics-label { font-size: 12px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; font-weight: 600; }
+      .analytics-value { font-size: 28px; font-weight: 800; color: var(--navy); letter-spacing: -0.5px; }
+
+      .section { background: white; border-radius: 12px; border: 1px solid var(--gray-100); margin-bottom: 24px; overflow: hidden; }
+      .section-header { padding: 16px 20px; border-bottom: 1px solid var(--gray-100); font-weight: 700; font-size: 15px; }
+
+      /* TREND CHART */
+      .trend-chart { padding: 24px; display: flex; gap: 8px; align-items: flex-end; }
+      .trend-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex: 1; }
+      .trend-bar-wrap { width: 100%; max-width: 32px; height: 100px; display: flex; align-items: flex-end; }
+      .trend-bar { width: 100%; background: linear-gradient(180deg, var(--sky), var(--blue)); border-radius: 6px 6px 0 0; transition: height 0.3s; }
+      .trend-label { font-size: 11px; color: var(--gray-500); }
+      .trend-count { font-size: 12px; color: var(--navy); font-weight: 700; }
+
+      /* SUMMARY GRID */
+      .summary-grid { padding: 20px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+      .summary-label { font-size: 12px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+      .summary-value { font-size: 24px; font-weight: 800; color: var(--navy); margin-top: 4px; letter-spacing: -0.5px; }
+
+      /* URGENCY */
+      .urgency-row { padding: 20px; display: flex; gap: 24px; }
+      .urgency-item { text-align: center; }
+      .urgency-circle { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 18px; margin: 0 auto; }
+      .urgency-label { font-size: 12px; color: var(--gray-500); margin-top: 8px; font-weight: 600; }
+
+      /* LEAD LIST */
+      .lead-list { display: flex; flex-direction: column; }
+      .lead-row { display: flex; align-items: flex-start; gap: 14px; padding: 16px 20px; border-bottom: 1px solid var(--gray-100); cursor: pointer; transition: background 0.15s; }
+      .lead-row:last-child { border-bottom: none; }
+      .lead-row:hover { background: var(--gray-50); }
+      .lead-avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--blue-light); color: var(--blue); font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+      .lead-main { flex: 1; min-width: 0; }
+      .lead-name-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+      .lead-name { font-size: 15px; font-weight: 700; color: var(--navy); }
+      .lead-date { font-size: 12px; color: var(--gray-500); white-space: nowrap; }
+      .lead-phone { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
+      .lead-summary { font-size: 13px; color: var(--gray-700); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 480px; }
+      .lead-tags { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; }
+      .tag { font-size: 11px; padding: 3px 10px; border-radius: 100px; font-weight: 700; text-transform: capitalize; white-space: nowrap; }
+
+      /* APPT LIST */
+      .appt-list { display: flex; flex-direction: column; }
+      .appt-row { display: flex; align-items: center; gap: 16px; padding: 16px 20px; border-bottom: 1px solid var(--gray-100); }
+      .appt-row:last-child { border-bottom: none; }
+      .appt-date-block { width: 52px; height: 52px; border-radius: 10px; background: var(--navy); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
+      .appt-month { font-size: 10px; font-weight: 700; color: var(--sky); letter-spacing: 0.5px; }
+      .appt-day { font-size: 18px; font-weight: 800; line-height: 1; margin-top: 2px; }
+      .appt-main { flex: 1; min-width: 0; }
+      .appt-name-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .appt-name { font-size: 15px; font-weight: 700; color: var(--navy); }
+      .appt-detail { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
+      .appt-address { font-size: 13px; color: var(--gray-700); margin-top: 4px; }
+      .appt-address.muted { color: var(--gray-300); }
+      .appt-code { text-align: center; flex-shrink: 0; }
+      .code-label { font-size: 10px; color: var(--gray-300); font-weight: 700; letter-spacing: 0.5px; }
+      .code-value { font-size: 13px; font-weight: 800; color: var(--blue); font-family: monospace; margin-top: 2px; }
+
+      /* MODAL */
+      .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
       .modal.active { display: flex; }
-      .modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 90%; max-height: 80vh; overflow-y: auto; }
-      .modal-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
-      .modal-close { cursor: pointer; color: #999; font-size: 24px; line-height: 1; }
-      .convo { background: #f5f5f5; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; max-height: 300px; overflow-y: auto; }
+      .modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 100%; max-height: 80vh; overflow-y: auto; }
+      .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 16px; color: var(--navy); }
+      .modal-close { cursor: pointer; color: var(--gray-300); font-size: 24px; line-height: 1; float: right; }
+      .convo { background: var(--gray-50); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; max-height: 300px; overflow-y: auto; }
       .msg { margin-bottom: 8px; display: flex; }
       .msg.customer { justify-content: flex-end; }
       .msg.assistant { justify-content: flex-start; }
       .bubble { display: inline-block; padding: 8px 12px; border-radius: 12px; max-width: 80%; word-break: break-word; }
-      .customer .bubble { background: #111; color: white; border-radius: 12px 12px 2px 12px; }
-      .assistant .bubble { background: #e5e5ea; color: #111; border-radius: 12px 12px 12px 2px; }
+      .customer .bubble { background: var(--navy); color: white; border-radius: 12px 12px 2px 12px; }
+      .assistant .bubble { background: var(--gray-100); color: var(--navy); border-radius: 12px 12px 12px 2px; }
       .field { margin-bottom: 12px; }
-      .field-label { font-size: 11px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-      .field-value { font-size: 14px; }
-      .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid #eee; }
-      .tab-btn { background: none; border: none; padding: 10px 16px; font-size: 14px; font-weight: 500; color: #666; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; }
-      .tab-btn.active { color: #111; border-bottom-color: #1A6FDB; }
-      .tab-content { display: none; }
-      .tab-content.active { display: block; }
-      .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-      .analytics-card { background: white; border-radius: 12px; border: 1px solid #eee; padding: 20px; }
-      .analytics-card.highlight { background: #0D1B2A; border-color: #0D1B2A; }
-      .analytics-card.highlight .analytics-label { color: rgba(255,255,255,0.6); }
-      .analytics-card.highlight .analytics-value { color: #4A9FFF; }
-      .analytics-label { font-size: 12px; color: #999; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-      .analytics-value { font-size: 28px; font-weight: 700; color: #111; }
+      .field-label { font-size: 11px; color: var(--gray-300); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; font-weight: 700; }
+      .field-value { font-size: 14px; color: var(--navy); }
+
       @media (max-width: 768px) {
         .analytics-grid { grid-template-columns: repeat(2, 1fr); }
+        .summary-grid { grid-template-columns: 1fr; }
+        .lead-summary { max-width: 200px; }
+        .lead-name-line { flex-direction: column; align-items: flex-start; gap: 2px; }
       }
     </style>
   </head>
   <body>
     <div class="nav">
-      <div class="nav-title">Missed Call Recovery</div>
+      <div class="nav-title">Missed<span>Pro</span></div>
       <a href="/dashboard/logout">Sign out</a>
     </div>
     <div class="container">
