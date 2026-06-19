@@ -98,16 +98,18 @@ async function sendLeadNotification(business, lead, appointmentDetails = null) {
     </html>
   `;
 
+  const fromAddress = 'MissedPro <onboarding@resend.dev>';
+
   try {
-    await resend.emails.send({
-      from: 'MissedPro <onboarding@resend.dev>',
+    const result = await resend.emails.send({
+      from: fromAddress,
       to: business.owner_email,
       subject,
       html,
     });
-    console.log(`Email notification sent to ${business.owner_email}`);
+    console.log('Email send result:', JSON.stringify(result));
   } catch (err) {
-    console.error('Email notification failed:', err);
+    console.error('Email notification failed:', err.message || JSON.stringify(err));
   }
 }
 
