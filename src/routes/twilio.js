@@ -325,6 +325,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
+  const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
+
   // PRIORITY 1: Pending slots + number selection
   const recentSystem = [...convo].reverse().find(m => m.role === 'system');
   if (recentSystem && /^[123]$/.test(text.trim())) {
@@ -336,13 +338,10 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       return res.status(200).send('<Response></Response>');
     }
 
-    // Skip if this is a pendingConfirmation system message not a slot selection
-    if (pendingData.pendingConfirmation) {
-      // Fall through to other priorities
-    } else {
+    if (!pendingData.pendingConfirmation) {
       const { pendingSlots, businessId } = pendingData;
       const index = parseInt(text.trim()) - 1;
-      const chosen = pendingSlots[index];
+      const chosen = pendingSlots ? pendingSlots[index] : null;
 
       if (!chosen) {
         await sendAndLog(lead.id, From, `Please reply with 1, 2, or 3 to select a time.`);
@@ -354,7 +353,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       if (!result.success) {
         await sendAndLog(lead.id, From, `Sorry, that time was just taken. What other day works for you?`);
       } else {
-        // Ask for address BEFORE confirming — store confirmation details in system message
         updateLead(lead.id, { status: 'scheduled' });
 
         appendToConversation(lead.id, 'system', JSON.stringify({
@@ -412,7 +410,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   }
 
   // PRIORITY 4: Check if waiting for address (includes pending confirmation flow)
-  const lastAssistantMsg = [...convo].reverse().find(m => m.role === 'assistant');
   const waitingForAddress = lastAssistantMsg && (
     lastAssistantMsg.body.toLowerCase().includes('service address') ||
     lastAssistantMsg.body.toLowerCase().includes('address so our technician') ||
@@ -422,7 +419,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (waitingForAddress) {
     const appt = getAppointmentByPhone(From);
 
-    // Find pending confirmation details if any
     const pendingConfirmMsg = [...convo].reverse().find(m => {
       if (m.role !== 'system') return false;
       try { return JSON.parse(m.body).pendingConfirmation; } catch { return false; }
@@ -468,10 +464,15 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   // PRIORITY 5: First message — save as reason
   if (!lead.reason) {
-    if (containsDateOrDay(text) && business) {
-      const parsedDate = parseDateFromMessage(text);
-      const timePreference = getTimePreferenceFromText(text);
+    const firstMsgHasBookingIntent = text.toLowerCase().includes('book') ||
+      text.toLowerCase().includes('appointment') ||
+      text.toLowerCase().includes('schedule') ||
+      text.toLowerCase().includes('come in') ||
+      text.toLowerCase().includes('visit') ||
+      containsDateOrDay(text) ||
+      isAnytimeResponse(text);
 
+    if (firstMsgHasBookingIntent && business) {
       updateLead(lead.id, { reason: text });
       classifyLead(From, text)
         .then(result => {
@@ -485,10 +486,24 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         })
         .catch(err => console.error('Classification failed:', err));
 
-      if (parsedDate) {
-        await showSlotsForDate(lead, business, parsedDate, timePreference, From);
-        return res.status(200).send('<Response></Response>');
+      if (containsDateOrDay(text) || isAnytimeResponse(text)) {
+        if (isAnytimeResponse(text)) {
+          const available = getNextAvailableDays(business.id, 7);
+          if (available.length > 0) {
+            await showSlotsForDate(lead, business, available[0].date, null, From);
+            return res.status(200).send('<Response></Response>');
+          }
+        }
+        const parsedDate = parseDateFromMessage(text);
+        const timePreference = getTimePreferenceFromText(text);
+        if (parsedDate) {
+          await showSlotsForDate(lead, business, parsedDate, timePreference, From);
+          return res.status(200).send('<Response></Response>');
+        }
       }
+
+      await sendAndLog(lead.id, From, `What day works best for you?`);
+      return res.status(200).send('<Response></Response>');
     }
 
     if (text.length > 3) {
@@ -511,7 +526,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
   }
 
-  // Check last assistant message context
+  // Determine context from last assistant message
   const lastMsgWasBookingQuestion = lastAssistantMsg &&
     lastAssistantMsg.body.toLowerCase().includes('book an appointment');
   const lastMsgWasDayQuestion = lastAssistantMsg && (
