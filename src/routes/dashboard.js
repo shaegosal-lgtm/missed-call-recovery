@@ -91,7 +91,6 @@ router.get('/logout', (req, res) => {
   res.redirect('/dashboard/login');
 });
 
-// Mark a lead as viewed
 router.post('/api/leads/:id/view', requireAuth, (req, res) => {
   db.prepare('UPDATE leads SET viewed = 1 WHERE id = ?').run(req.params.id);
   res.json({ success: true });
@@ -159,7 +158,6 @@ router.get('/business/:id', requireAuth, (req, res) => {
     ORDER BY a.start_time ASC
   `).all(business.id);
 
-  // ANALYTICS CALCULATIONS
   const now = new Date();
   const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
@@ -189,20 +187,6 @@ router.get('/business/:id', requireAuth, (req, res) => {
   }
   const maxDayCount = Math.max(...last7Days.map(d => d.count), 1);
 
-  const urgencyStyle = {
-    high: { bg: '#FEE2E2', text: '#DC2626' },
-    medium: { bg: '#FEF3C7', text: '#D97706' },
-    low: { bg: '#DCFCE7', text: '#16A34A' },
-    unknown: { bg: '#F1F5F9', text: '#64748B' }
-  };
-
-  const statusStyle = {
-    new: { bg: '#EBF3FF', text: '#1A6FDB' },
-    scheduled: { bg: '#DCFCE7', text: '#16A34A' },
-    closed: { bg: '#F1F5F9', text: '#64748B' },
-    cancelled: { bg: '#FEE2E2', text: '#DC2626' },
-  };
-
   function initials(name, phone) {
     if (name) {
       const parts = name.trim().split(' ');
@@ -212,8 +196,6 @@ router.get('/business/:id', requireAuth, (req, res) => {
   }
 
   const leadCards = leads.map(l => {
-    const u = urgencyStyle[l.urgency] || urgencyStyle.unknown;
-    const s = statusStyle[l.status] || statusStyle.new;
     const isNew = !l.viewed;
     return `
     <div class="lead-row ${isNew ? 'is-new' : ''}" onclick="showLead('${l.id}')" data-lead-id="${l.id}">
@@ -234,28 +216,73 @@ router.get('/business/:id', requireAuth, (req, res) => {
     </div>
   `}).join('');
 
-  const apptCards = appointments.map(a => {
+  // ===== APPOINTMENTS TAB ENHANCEMENT =====
+  const nowMs = Date.now();
+  const todayStr = new Date().toISOString().split('T')[0];
+  const tomorrowDate = new Date();
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const tomorrowStr = tomorrowDate.toISOString().split('T')[0];
+
+  const activeAppts = appointments.filter(a => a.status !== 'cancelled');
+  const upcomingAppts = activeAppts
+    .filter(a => new Date(a.start_time).getTime() >= nowMs)
+    .sort((a, b) => new Date(a.start_time) - new Date(b.start_time));
+  const pastAppts = activeAppts
+    .filter(a => new Date(a.start_time).getTime() < nowMs)
+    .sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
+  const cancelledAppts = appointments
+    .filter(a => a.status === 'cancelled')
+    .sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
+
+  const upcomingThisWeek = upcomingAppts.filter(a => {
+    const diffDays = (new Date(a.start_time) - now) / (1000 * 60 * 60 * 24);
+    return diffDays <= 7;
+  }).length;
+
+  const missingAddressCount = upcomingAppts.filter(a => !a.service_address).length;
+
+  function renderApptCard(a, options = {}) {
     const startDate = new Date(a.start_time);
+    const dateStr = startDate.toISOString().split('T')[0];
+    let badge = '';
+    if (a.status === 'cancelled') {
+      badge = '';
+    } else if (dateStr === todayStr) {
+      badge = '<span class="day-badge today">TODAY</span>';
+    } else if (dateStr === tomorrowStr) {
+      badge = '<span class="day-badge tomorrow">TOMORROW</span>';
+    }
+
     return `
-    <div class="appt-row">
-      <div class="appt-date-block">
+    <div class="appt-row ${options.dimmed ? 'dimmed' : ''}">
+      <div class="appt-date-block ${a.status === 'cancelled' ? 'cancelled-block' : ''}">
         <div class="appt-month">${startDate.toLocaleDateString('en-US', { month: 'short' }).toUpperCase()}</div>
         <div class="appt-day">${startDate.getDate()}</div>
       </div>
       <div class="appt-main">
         <div class="appt-name-line">
           <span class="appt-name">${a.lead_name || 'Unknown'}</span>
-          <span class="tag-lg status-${a.status}">${a.status}</span>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${badge}
+            <span class="tag-lg status-${a.status}">${a.status === 'cancelled' ? 'Cancelled' : a.status}</span>
+          </div>
         </div>
-        <div class="appt-detail">${startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })} · ${a.phone}</div>
-        ${a.service_address ? `<div class="appt-address">📍 ${a.service_address}</div>` : '<div class="appt-address muted">📍 Address pending</div>'}
+        <div class="appt-detail">${startDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })} · ${a.phone}</div>
+        ${a.service_address
+          ? `<div class="appt-address">📍 ${a.service_address}</div>`
+          : a.status !== 'cancelled' ? '<div class="appt-address-missing">⚠️ Address not collected</div>' : ''}
       </div>
       <div class="appt-code">
         <div class="code-label">CODE</div>
         <div class="code-value">${a.confirmation_code || '-'}</div>
       </div>
     </div>
-  `}).join('');
+  `;
+  }
+
+  const upcomingCards = upcomingAppts.map(a => renderApptCard(a)).join('');
+  const pastCards = pastAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
+  const cancelledCards = cancelledAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
 
   const leadData = JSON.stringify(leads).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
@@ -278,7 +305,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
       <button class="tab-btn" onclick="switchTab('leads', this)">Leads <span class="tab-count">${leads.length}</span></button>
-      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${appointments.length}</span></button>
+      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${upcomingAppts.length}</span></button>
     </div>
 
     <div id="tab-overview" class="tab-content active">
@@ -350,14 +377,64 @@ router.get('/business/:id', requireAuth, (req, res) => {
     </div>
 
     <div id="tab-leads" class="tab-content">
+      <div class="legend">
+        <span class="legend-title">Legend:</span>
+        <span class="legend-group-label">Status</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#1A6FDB"></span>New</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#16A34A"></span>Scheduled</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#D97706"></span>Needs Follow-Up</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#64748B"></span>Closed</span>
+        <span class="legend-divider"></span>
+        <span class="legend-group-label">Urgency</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#DC2626"></span>High</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#F59E0B"></span>Medium</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#16A34A"></span>Low</span>
+      </div>
       <div class="section">
         ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `<div class="lead-list">${leadCards}</div>`}
       </div>
     </div>
 
     <div id="tab-appointments" class="tab-content">
-      <div class="section">
-        ${appointments.length === 0 ? '<div class="empty">No appointments yet</div>' : `<div class="appt-list">${apptCards}</div>`}
+      <div class="appt-stats-strip">
+        <div class="appt-stat">
+          <div class="appt-stat-num">${upcomingAppts.length}</div>
+          <div class="appt-stat-label">Upcoming</div>
+        </div>
+        <div class="appt-stat">
+          <div class="appt-stat-num">${upcomingThisWeek}</div>
+          <div class="appt-stat-label">This Week</div>
+        </div>
+        <div class="appt-stat ${missingAddressCount > 0 ? 'warn' : ''}">
+          <div class="appt-stat-num">${missingAddressCount}</div>
+          <div class="appt-stat-label">Missing Address</div>
+        </div>
+        <div class="appt-stat">
+          <div class="appt-stat-num">$${(upcomingAppts.length * avgJobValue).toLocaleString()}</div>
+          <div class="appt-stat-label">Pipeline Value</div>
+        </div>
+      </div>
+
+      <div class="appt-subtabs">
+        <button class="appt-subtab-btn active" onclick="switchApptSubtab('upcoming', this)">Upcoming (${upcomingAppts.length})</button>
+        <button class="appt-subtab-btn" onclick="switchApptSubtab('past', this)">Past (${pastAppts.length})</button>
+        <button class="appt-subtab-btn" onclick="switchApptSubtab('cancelled', this)">Cancelled (${cancelledAppts.length})</button>
+      </div>
+
+      <div id="appt-sub-upcoming" class="appt-subtab-content active">
+        <div class="section">
+          ${upcomingAppts.length === 0 ? '<div class="empty">No upcoming appointments</div>' : `<div class="appt-list">${upcomingCards}</div>`}
+        </div>
+      </div>
+      <div id="appt-sub-past" class="appt-subtab-content">
+        <div class="section">
+          ${pastAppts.length === 0 ? '<div class="empty">No past appointments</div>' : `<div class="appt-list">${pastCards}</div>`}
+        </div>
+      </div>
+      <div id="appt-sub-cancelled" class="appt-subtab-content">
+        <div class="section">
+          ${cancelledAppts.length === 0 ? '<div class="empty">No cancelled appointments</div>' : `<div class="appt-list">${cancelledCards}</div>`}
+        </div>
       </div>
     </div>
 
@@ -376,6 +453,13 @@ router.get('/business/:id', requireAuth, (req, res) => {
         document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
         document.getElementById('tab-' + tabName).classList.add('active');
+        btn.classList.add('active');
+      }
+
+      function switchApptSubtab(name, btn) {
+        document.querySelectorAll('.appt-subtab-content').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.appt-subtab-btn').forEach(el => el.classList.remove('active'));
+        document.getElementById('appt-sub-' + name).classList.add('active');
         btn.classList.add('active');
       }
 
@@ -403,7 +487,6 @@ router.get('/business/:id', requireAuth, (req, res) => {
 
         document.getElementById('modal').classList.add('active');
 
-        // Mark as viewed
         const row = document.querySelector('[data-lead-id="' + id + '"]');
         if (row && row.classList.contains('is-new')) {
           row.classList.remove('is-new');
@@ -471,7 +554,6 @@ function renderPage(title, content, role) {
 
       .empty { padding: 40px; text-align: center; color: var(--gray-500); font-size: 14px; }
 
-      /* TABS */
       .tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--gray-100); }
       .tab-btn { background: none; border: none; padding: 12px 18px; font-size: 14px; font-weight: 600; color: var(--gray-500); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; display: flex; align-items: center; gap: 6px; }
       .tab-btn:hover { color: var(--navy); }
@@ -481,7 +563,6 @@ function renderPage(title, content, role) {
       .tab-content { display: none; }
       .tab-content.active { display: block; }
 
-      /* ANALYTICS */
       .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
       .analytics-card { background: white; border-radius: 12px; border: 1px solid var(--gray-100); padding: 20px; }
       .analytics-card.highlight { background: var(--navy); border-color: var(--navy); }
@@ -493,7 +574,6 @@ function renderPage(title, content, role) {
       .section { background: white; border-radius: 12px; border: 1px solid var(--gray-100); margin-bottom: 24px; overflow: hidden; }
       .section-header { padding: 16px 20px; border-bottom: 1px solid var(--gray-100); font-weight: 700; font-size: 15px; }
 
-      /* TREND CHART */
       .trend-chart { padding: 24px; display: flex; gap: 8px; align-items: flex-end; }
       .trend-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex: 1; }
       .trend-bar-wrap { width: 100%; max-width: 32px; height: 100px; display: flex; align-items: flex-end; }
@@ -501,18 +581,22 @@ function renderPage(title, content, role) {
       .trend-label { font-size: 11px; color: var(--gray-500); }
       .trend-count { font-size: 12px; color: var(--navy); font-weight: 700; }
 
-      /* SUMMARY GRID */
       .summary-grid { padding: 20px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
       .summary-label { font-size: 12px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
       .summary-value { font-size: 24px; font-weight: 800; color: var(--navy); margin-top: 4px; letter-spacing: -0.5px; }
 
-      /* URGENCY */
       .urgency-row { padding: 20px; display: flex; gap: 24px; }
       .urgency-item { text-align: center; }
       .urgency-circle { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 18px; margin: 0 auto; }
       .urgency-label { font-size: 12px; color: var(--gray-500); margin-top: 8px; font-weight: 600; }
 
-      /* LEAD LIST */
+      .legend { background: white; border: 1px solid var(--gray-100); border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 12px; color: var(--gray-700); }
+      .legend-title { font-weight: 700; color: var(--navy); }
+      .legend-group-label { font-weight: 700; color: var(--gray-500); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+      .legend-item { display: flex; align-items: center; gap: 6px; }
+      .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+      .legend-divider { width: 1px; height: 16px; background: var(--gray-100); margin: 0 4px; }
+
       .lead-list { display: flex; flex-direction: column; }
       .lead-row { display: flex; align-items: flex-start; gap: 14px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); cursor: pointer; transition: background 0.15s; position: relative; }
       .lead-row:last-child { border-bottom: none; }
@@ -529,7 +613,6 @@ function renderPage(title, content, role) {
       .lead-summary { font-size: 14px; color: var(--gray-700); margin-top: 8px; line-height: 1.4; }
       .lead-tags { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; flex-shrink: 0; }
 
-      /* BIGGER TAGS */
       .tag-lg { font-size: 13px; padding: 6px 14px; border-radius: 8px; font-weight: 700; text-transform: capitalize; white-space: nowrap; min-width: 80px; text-align: center; }
       .urgency-high { background: #DC2626; color: white; }
       .urgency-medium { background: #F59E0B; color: white; }
@@ -537,27 +620,47 @@ function renderPage(title, content, role) {
       .urgency-unknown { background: var(--gray-300); color: white; }
       .status-new { background: var(--blue); color: white; }
       .status-scheduled { background: #16A34A; color: white; }
+      .status-needs_followup { background: #D97706; color: white; }
       .status-closed { background: var(--gray-500); color: white; }
       .status-cancelled { background: #DC2626; color: white; }
 
-      /* APPT LIST */
+      /* APPT STATS STRIP */
+      .appt-stats-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+      .appt-stat { background: white; border: 1px solid var(--gray-100); border-radius: 10px; padding: 14px; text-align: center; }
+      .appt-stat.warn { border-color: #FDE68A; background: #FFFBEB; }
+      .appt-stat.warn .appt-stat-num { color: #D97706; }
+      .appt-stat-num { font-size: 22px; font-weight: 800; color: var(--navy); }
+      .appt-stat-label { font-size: 11px; color: var(--gray-500); margin-top: 2px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
+
+      /* APPT SUBTABS */
+      .appt-subtabs { display: flex; gap: 8px; margin-bottom: 16px; }
+      .appt-subtab-btn { background: white; border: 1px solid var(--gray-100); padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--gray-500); cursor: pointer; font-family: inherit; }
+      .appt-subtab-btn.active { background: var(--navy); color: white; border-color: var(--navy); }
+      .appt-subtab-content { display: none; }
+      .appt-subtab-content.active { display: block; }
+
       .appt-list { display: flex; flex-direction: column; }
       .appt-row { display: flex; align-items: center; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); }
       .appt-row:last-child { border-bottom: none; }
+      .appt-row.dimmed { opacity: 0.6; }
       .appt-date-block { width: 56px; height: 56px; border-radius: 10px; background: var(--navy); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
+      .appt-date-block.cancelled-block { background: var(--gray-300); }
       .appt-month { font-size: 10px; font-weight: 700; color: var(--sky); letter-spacing: 0.5px; }
+      .appt-date-block.cancelled-block .appt-month { color: white; }
       .appt-day { font-size: 20px; font-weight: 800; line-height: 1; margin-top: 2px; }
       .appt-main { flex: 1; min-width: 0; }
-      .appt-name-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .appt-name-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
       .appt-name { font-size: 16px; font-weight: 700; color: var(--navy); }
       .appt-detail { font-size: 13px; color: var(--gray-500); margin-top: 4px; }
       .appt-address { font-size: 13px; color: var(--gray-700); margin-top: 6px; }
-      .appt-address.muted { color: var(--gray-300); }
+      .appt-address-missing { font-size: 13px; color: #D97706; margin-top: 6px; font-weight: 600; }
       .appt-code { text-align: center; flex-shrink: 0; }
       .code-label { font-size: 10px; color: var(--gray-300); font-weight: 700; letter-spacing: 0.5px; }
       .code-value { font-size: 14px; font-weight: 800; color: var(--blue); font-family: monospace; margin-top: 2px; }
+      .day-badge { font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 100px; letter-spacing: 0.5px; }
+      .day-badge.today { background: #DC2626; color: white; }
+      .day-badge.tomorrow { background: #F59E0B; color: white; }
 
-      /* MODAL */
       .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
       .modal.active { display: flex; }
       .modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 100%; max-height: 80vh; overflow-y: auto; }
@@ -579,6 +682,8 @@ function renderPage(title, content, role) {
         .summary-grid { grid-template-columns: 1fr; }
         .lead-name-line { flex-direction: column; align-items: flex-start; gap: 2px; }
         .lead-tags { flex-direction: row; }
+        .appt-stats-strip { grid-template-columns: repeat(2, 1fr); }
+        .appt-subtabs { flex-wrap: wrap; }
       }
     </style>
   </head>
