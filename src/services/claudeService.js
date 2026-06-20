@@ -72,6 +72,11 @@ const TOOLS = [
       },
       required: ['reason']
     }
+  },
+  {
+    name: 'mark_conversation_closed',
+    description: 'Mark this conversation as closed/resolved with no further action needed. Call this ONLY when the customer has clearly declined service and is not booking an appointment (e.g. "not interested", "no thanks", "I found someone else", "just wanted pricing, that\'s it"). Do not call this if they might still want to book, or if a human needs to follow up with them.',
+    input_schema: { type: 'object', properties: {} }
   }
 ];
 
@@ -89,8 +94,6 @@ function resolveSlot(leadId, slotId) {
   return slotCache.get(key) || null;
 }
 
-// Builds an explicit lookup table mapping day names and relative terms to real YYYY-MM-DD dates
-// This removes ALL date math responsibility from Claude - it can only ever pick from this list
 function buildDateLookupTable() {
   const today = new Date();
   const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -111,31 +114,44 @@ function buildDateLookupTable() {
   return lines.join('\n');
 }
 
-async function classifyLead(phone, reason) {
-  const prompt = `You are helping a small appointment-based business qualify missed call leads.
+// Now takes the FULL conversation instead of a single message, for more meaningful urgency classification
+async function classifyLead(phone, conversationHistory) {
+  const convoText = conversationHistory
+    .filter(m => m.role === 'customer' || m.role === 'assistant')
+    .map(m => `${m.role === 'customer' ? 'Customer' : 'Receptionist'}: ${m.body}`)
+    .join('\n');
 
-A customer called and didn't get through. They texted back with this reason: "${reason}"
-Their phone number is: ${phone}
+  const prompt = `You are helping a small appointment-based business qualify a missed call lead based on their FULL conversation so far.
+
+Phone: ${phone}
+
+CONVERSATION:
+${convoText}
 
 Respond ONLY with a valid JSON object (no markdown, no explanation) in this exact format:
 {
   "urgency": "low" | "medium" | "high",
   "lead_type": "new_patient" | "existing" | "appointment" | "billing" | "other",
-  "summary": "one sentence for the front desk describing this lead"
+  "summary": "one or two sentences for the front desk summarizing the full situation, not just the opening message"
 }
 
-Urgency guide: high = pain/emergency/urgent, medium = wants appointment soon, low = general inquiry.`;
+URGENCY GUIDE - base this on the ENTIRE conversation, not just the first message:
+- HIGH: genuine emergency, active damage/danger, customer expresses significant distress or time pressure, repeated urgency cues, safety issue
+- MEDIUM: wants service relatively soon, mild inconvenience, no emergency language, standard scheduling request
+- LOW: general inquiry, pricing question only, no clear timeline, browsing/considering, or customer seems to have lost interest
+
+Consider tone, repeated frustration, explicit urgency language ("ASAP", "right now", "emergency", "flooding", "can't wait"), and how the conversation evolved - not just the first sentence.`;
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-5',
-    max_tokens: 200,
+    max_tokens: 250,
     messages: [{ role: 'user', content: prompt }],
   });
 
   try {
     return JSON.parse(response.content[0].text);
   } catch {
-    return { urgency: 'medium', lead_type: 'other', summary: reason };
+    return { urgency: 'medium', lead_type: 'other', summary: convoText.slice(0, 150) };
   }
 }
 
@@ -249,6 +265,9 @@ function executeToolCall(toolName, toolInput, context) {
   } else if (toolName === 'flag_needs_followup') {
     updateLead(lead.id, { status: 'needs_followup' });
     result = { success: true, flagged: true };
+  } else if (toolName === 'mark_conversation_closed') {
+    updateLead(lead.id, { status: 'closed' });
+    result = { success: true, closed: true };
   } else {
     result = { error: 'Unknown tool' };
   }
@@ -280,7 +299,7 @@ TODAY'S DATE: ${dayName}, ${todayStr}
 DATE LOOKUP TABLE - YOU MUST USE THIS, NEVER CALCULATE DATES YOURSELF:
 ${dateLookupTable}
 
-When a customer mentions a day (e.g. "Tuesday", "next Friday", "tomorrow"), find the matching line in the table above and use that EXACT date string for the check_availability tool. Do not do your own date math. Do not guess. If the customer says "next [day]", use the SECOND occurrence of that day name in the table (skip the first/nearest one). If they just say a day name with no "next", use the FIRST occurrence.
+When a customer mentions a day, find the matching line in the table above and use that EXACT date string. If the customer says "next [day]", use the SECOND occurrence of that day name. If they just say a day name with no "next", use the FIRST occurrence.
 
 BUSINESS INFORMATION:
 ${businessInfo}
@@ -291,34 +310,37 @@ WHAT YOU KNOW ABOUT THIS CUSTOMER:
 ${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
 
 CRITICAL GROUNDING RULE:
-You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result. When stating a day or date back to the customer, always use the exact date_formatted or appointment_label value from the tool result - never restate the day yourself from memory.
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details.
 
-SLOT BOOKING RULE - VERY IMPORTANT:
-When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result - never type out a date/time yourself as the identifier.
+SLOT BOOKING RULE:
+When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result.
 
 ADDRESS HANDLING:
-When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address" if this customer had a previous address on file. If so, do NOT ask for the address again - just confirm it naturally. If address_carried_over is false, you must ask for the address before giving the confirmation code.
+When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address". If so, do NOT ask for the address again. If false, ask for the address before giving the confirmation code.
+
+CLOSING A CONVERSATION:
+If the customer clearly declines service (says "not interested", "no thanks", "I'll go elsewhere", or similar, and is NOT booking an appointment), call mark_conversation_closed after responding warmly. Do not call this if they might still come back to book, or if you've flagged them for human follow-up - those stay open for the team.
 
 CORE BEHAVIOR RULES:
 1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
 2. Keep messages under 320 characters. Be concise.
 3. No emojis.
 4. One question at a time.
-5. When a customer wants to book: find the correct date using the DATE LOOKUP TABLE above, then call check_availability with that exact date string.
+5. When a customer wants to book: find the correct date using the DATE LOOKUP TABLE, then call check_availability.
 6. Present at most 3 options using the EXACT wording/times the tool returned.
-7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters. Keep trying reasonable alternatives before giving up.
-8. Once the customer confirms a specific slot, call book_appointment with the matching slot_id.
-9. After book_appointment succeeds, check if address_carried_over is true. If false, ask for the service address BEFORE mentioning any confirmation code. If true, mention the carried-over address naturally and proceed straight to the confirmation code.
-10. When the customer gives a NEW address, call save_customer_info, then state the confirmation code EXACTLY as returned, and the appointment time EXACTLY as returned in appointment_label.
-11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code exactly as returned.
-12. If the customer wants to cancel, call cancel_appointment, then only confirm cancellation if the tool result shows success:true.
+7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters.
+8. Once confirmed, call book_appointment with the matching slot_id.
+9. After book_appointment succeeds, check address_carried_over - ask for address if false, otherwise proceed straight to confirmation code.
+10. When the customer gives a NEW address, call save_customer_info, then state the confirmation code and time exactly as returned.
+11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code.
+12. If the customer wants to cancel, call cancel_appointment, then only confirm if success:true.
 13. For questions answerable from business information, answer directly.
 14. For anything you cannot answer, call flag_needs_followup, then let them know a team member will follow up.
 15. Never claim to be human if asked.
 16. Never repeat a message already sent in this conversation.
 17. Acknowledge urgency briefly, then prioritize booking quickly.
-18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally - never imply their existing appointment might not be confirmed.
-19. If a customer's message contains multiple pieces of information at once (name, address, day, time preference, reason, all together), carefully parse each piece separately before acting - especially the requested day, using the DATE LOOKUP TABLE.
+18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally.
+19. If a customer's message contains multiple pieces of information at once, parse each piece separately, especially the requested day, using the DATE LOOKUP TABLE.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -339,6 +361,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     cancelFailed: false,
     lastCheckAvailabilityDate: null,
     lastCheckAvailabilityDateFormatted: null,
+    closedThisTurn: false,
   };
 
   while (iterations < maxIterations) {
@@ -386,6 +409,9 @@ Respond naturally. Use tools whenever you need real information or need to take 
         if (result.success) verifiedFacts.cancelledThisTurn = true;
         else verifiedFacts.cancelFailed = true;
       }
+      if (toolUse.name === 'mark_conversation_closed') {
+        verifiedFacts.closedThisTurn = true;
+      }
 
       toolResults.push({
         type: 'tool_result',
@@ -410,8 +436,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // 0. Validate the day mentioned when presenting availability options matches what the tool actually checked
-  // This catches wrong-day bugs BEFORE a booking happens, not just after
   if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn) {
     const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
     if (realDayMatch) {
@@ -428,7 +452,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // 1. NEW booking confirmation claims without verified booking this turn
   const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
 
   if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
@@ -451,7 +474,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // Verify the stated appointment time AND day-of-week match the real verified label (post-booking check)
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
     const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
     if (timeWordsInLabel) {
@@ -459,7 +481,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
       const allTimesInText = finalText.match(/\d{1,2}:\d{2}\s*[AP]M/gi) || [];
       const hasTimeMismatch = allTimesInText.some(t => t.toUpperCase().replace(/\s/g, '') !== realTime);
       if (hasTimeMismatch) {
-        console.error(`[GUARDRAIL] lead=${lead.id} Time mismatch detected. Real time: ${realTime}, text contains: ${allTimesInText.join(', ')}`);
+        console.error(`[GUARDRAIL] lead=${lead.id} Time mismatch detected.`);
         updateLead(lead.id, { status: 'needs_followup' });
         guardrailTriggered = true;
       }
@@ -473,7 +495,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
         const daysInText = finalText.match(dayPattern) || [];
         const hasDayMismatch = daysInText.some(d => d.toLowerCase() !== realDay.toLowerCase());
         if (hasDayMismatch) {
-          console.error(`[GUARDRAIL] lead=${lead.id} Day mismatch detected. Real day: ${realDay}, text contains: ${daysInText.join(', ')}`);
+          console.error(`[GUARDRAIL] lead=${lead.id} Day mismatch detected.`);
           updateLead(lead.id, { status: 'needs_followup' });
           guardrailTriggered = true;
         }
@@ -483,7 +505,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
 
   const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
   if (!guardrailTriggered && claimsCancellation && !verifiedFacts.cancelledThisTurn) {
-    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result. Text was: "${finalText}"`);
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result.`);
     finalText = verifiedFacts.cancelFailed
       ? "I couldn't find an active appointment to cancel under this number. A team member will follow up to confirm."
       : "Let me process that cancellation - a team member will confirm shortly.";
@@ -493,7 +515,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
 
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
   if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
-    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result. Text was: "${finalText}"`);
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result.`);
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
   }

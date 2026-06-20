@@ -133,36 +133,40 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  // Save first message as reason if not set yet
+  // Save first message as reason if not set yet - this is the customer's FIRST response, moving them off "new"
   if (!lead.reason && text.length > 2) {
     updateLead(lead.id, { reason: text });
     lead.reason = text;
+  }
 
-    classifyLead(From, text)
+  if (!business) {
+    await sendAndLog(lead.id, From, `Thanks for reaching out! A team member will get back to you shortly.`);
+    updateLead(lead.id, { status: 'needs_followup' });
+    return res.status(200).send('<Response></Response>');
+  }
+
+  let reply;
+  try {
+    reply = await runReceptionistConversation(business, lead, convo, text, From);
+    await sendAndLog(lead.id, From, reply);
+
+    // Re-classify urgency using the FULL conversation now that it includes this turn's reply
+    const updatedConvo = JSON.parse(getLeadByPhone(From)?.conversation || '[]');
+    classifyLead(From, updatedConvo)
       .then(async result => {
         updateLead(lead.id, {
           urgency: result.urgency,
           lead_type: result.lead_type,
           ai_summary: result.summary,
         });
-        await safeNotifyOwner({ ...lead, reason: text, ...result });
-        await safeSendLeadNotification(business || { name: 'the business' }, { ...lead, reason: text, ...result });
+        await safeNotifyOwner({ ...lead, ...result });
+        await safeSendLeadNotification(business, { ...lead, ...result });
       })
-      .catch(err => console.error('[sms-reply] Classification chain failed:', err.message || err));
-  }
+      .catch(err => console.error('[sms-reply] Classification failed:', err.message || err));
 
-  if (!business) {
-    await sendAndLog(lead.id, From, `Thanks for reaching out! A team member will get back to you shortly.`);
-    return res.status(200).send('<Response></Response>');
-  }
-
-  try {
-    const reply = await runReceptionistConversation(business, lead, convo, text, From);
-    await sendAndLog(lead.id, From, reply);
-
-    // If a booking just completed, send owner notification with details
+    // If a booking just completed, send a dedicated owner notification with appointment details
     if (reply.toLowerCase().includes('confirmation code')) {
-      const codeMatch = reply.match(/confirmation code:?\s*([a-z0-9]+)/i);
+      const codeMatch = reply.match(/confirmation code:?\s*(?:is)?\s*([a-z0-9]+)/i);
       const code = codeMatch ? codeMatch[1] : null;
       if (code) {
         await safeNotifyOwner({ ...lead, ai_summary: `Appointment booked. Code: ${code}` });
