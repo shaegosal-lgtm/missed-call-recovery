@@ -75,8 +75,6 @@ const TOOLS = [
   }
 ];
 
-// Server-side cache mapping slot_id -> real ISO timestamp, scoped per conversation turn
-// This guarantees Claude can never type out or corrupt a timestamp itself
 const slotCache = new Map();
 
 function cacheSlot(leadId, isoString) {
@@ -292,6 +290,7 @@ CORE BEHAVIOR RULES:
 16. Never repeat a message already sent in this conversation.
 17. Acknowledge urgency briefly, then prioritize booking quickly.
 18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally - never imply their existing appointment might not be confirmed.
+19. If a customer's message contains multiple pieces of information at once (name, address, day, time preference, reason, all together), carefully parse each piece separately before acting - especially the requested day. Double-check your interpretation of the day against TODAY'S DATE before calling check_availability, since compound messages are more error-prone. When stating the day back to the customer, always use the exact date_formatted or appointment_label value from the tool result, never your own restatement of what day you think it is.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -399,17 +398,32 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // Verify the stated appointment time matches the real verified label - catches any remaining drift
+  // Verify the stated appointment time AND day-of-week match the real verified label
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
     const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
     if (timeWordsInLabel) {
       const realTime = timeWordsInLabel[0].toUpperCase().replace(/\s/g, '');
       const allTimesInText = finalText.match(/\d{1,2}:\d{2}\s*[AP]M/gi) || [];
-      const hasMismatch = allTimesInText.some(t => t.toUpperCase().replace(/\s/g, '') !== realTime);
-      if (hasMismatch) {
+      const hasTimeMismatch = allTimesInText.some(t => t.toUpperCase().replace(/\s/g, '') !== realTime);
+      if (hasTimeMismatch) {
         console.error(`[GUARDRAIL] lead=${lead.id} Time mismatch detected. Real time: ${realTime}, text contains: ${allTimesInText.join(', ')}`);
         updateLead(lead.id, { status: 'needs_followup' });
         guardrailTriggered = true;
+      }
+    }
+
+    if (!guardrailTriggered) {
+      const realDayMatch = verifiedFacts.appointmentLabel.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
+      if (realDayMatch) {
+        const realDay = realDayMatch[1];
+        const dayPattern = /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi;
+        const daysInText = finalText.match(dayPattern) || [];
+        const hasDayMismatch = daysInText.some(d => d.toLowerCase() !== realDay.toLowerCase());
+        if (hasDayMismatch) {
+          console.error(`[GUARDRAIL] lead=${lead.id} Day mismatch detected. Real day: ${realDay}, text contains: ${daysInText.join(', ')}`);
+          updateLead(lead.id, { status: 'needs_followup' });
+          guardrailTriggered = true;
+        }
       }
     }
   }
