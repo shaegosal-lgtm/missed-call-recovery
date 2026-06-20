@@ -128,6 +128,14 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
     }
+
+    return res.status(200).type('text/xml').send(`
+      <Response>
+        <Say>Sorry we missed you. We will text you in just a moment so we can help you right away.</Say>
+        <Pause length="2"/>
+        <Hangup/>
+      </Response>
+    `);
   }
 
   res.status(200).type('text/xml').send('<Response></Response>');
