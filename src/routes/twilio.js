@@ -34,9 +34,11 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
   }
 }
 
-// Runs classification ONCE, awaited, using the freshest conversation snapshot.
-// Only call this at clear conversation-state-changing moments to avoid race conditions
-// from multiple overlapping background classification calls overwriting each other.
+// Runs classification ONCE per call, awaited, using the freshest conversation snapshot.
+// Called at two key moments: (1) the customer's first substantive reply, so even abandoned
+// conversations get an early urgency signal, and (2) genuine ending moments (booked, flagged,
+// closed) to refine that signal with the full picture. Each moment only fires once per lead,
+// so this cannot race against itself.
 async function runClassificationSafely(From, lead, business) {
   try {
     const freshLead = getLeadByPhone(From) || lead;
@@ -155,7 +157,8 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  if (!lead.reason && text.length > 2) {
+  const isFirstSubstantiveReply = !lead.reason && text.length > 2;
+  if (isFirstSubstantiveReply) {
     updateLead(lead.id, { reason: text });
     lead.reason = text;
   }
@@ -172,7 +175,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     reply = await runReceptionistConversation(business, lead, convo, text, From);
     await sendAndLog(lead.id, From, reply);
 
-    // Check if this turn changed the lead into a meaningful end-state - only classify at these moments
     const leadAfterReply = getLeadByPhone(From);
     const statusChanged = leadAfterReply && leadAfterReply.status !== lead.status;
     const isMeaningfulMoment =
@@ -181,7 +183,9 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       (leadAfterReply && leadAfterReply.status === 'closed') ||
       statusChanged;
 
-    if (isMeaningfulMoment) {
+    // Classify on the first real reply (early signal, even if conversation is abandoned)
+    // AND at meaningful ending moments (refines the signal with full context)
+    if (isMeaningfulMoment || isFirstSubstantiveReply) {
       await runClassificationSafely(From, lead, business);
     }
 
