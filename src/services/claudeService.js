@@ -34,7 +34,7 @@ const TOOLS = [
   },
   {
     name: 'book_appointment',
-    description: 'Book a specific appointment slot. Only call after the customer explicitly confirms a specific date/time that was returned from check_availability.',
+    description: 'Book a specific appointment slot. Only call after the customer explicitly confirms a specific date/time that was returned from check_availability. If the customer had a previous appointment with an address already on file (e.g. during a reschedule), that address will be automatically carried over - you do not need to ask again unless the carried-over address was not found.',
     input_schema: {
       type: 'object',
       properties: {
@@ -107,6 +107,17 @@ function logToolCall(leadId, toolName, input, result) {
   console.log(`[TOOL_CALL] lead=${leadId} tool=${toolName} input=${JSON.stringify(input)} result=${JSON.stringify(result)}`);
 }
 
+function findMostRecentAddressForPhone(phone) {
+  // Look up the most recent appointment (any status) for this phone number that has a saved address
+  const row = db.prepare(`
+    SELECT a.service_address FROM appointments a
+    JOIN leads l ON a.lead_id = l.id
+    WHERE l.phone = ? AND a.service_address IS NOT NULL AND a.address_confirmed = 1
+    ORDER BY a.created_at DESC LIMIT 1
+  `).get(phone);
+  return row ? row.service_address : null;
+}
+
 function executeToolCall(toolName, toolInput, context) {
   const { business, lead, From } = context;
   let result;
@@ -158,10 +169,22 @@ function executeToolCall(toolName, toolInput, context) {
         weekday: 'long', month: 'long', day: 'numeric',
         hour: 'numeric', minute: '2-digit'
       });
+
+      // Carry over address from a previous appointment under this phone number, if one exists
+      const carriedAddress = findMostRecentAddressForPhone(From);
+      let addressCarriedOver = false;
+      if (carriedAddress) {
+        db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
+          .run(carriedAddress, bookResult.appointmentId);
+        addressCarriedOver = true;
+      }
+
       result = {
         success: true,
         confirmation_code: bookResult.confirmationCode,
-        appointment_label: label
+        appointment_label: label,
+        address_carried_over: addressCarriedOver,
+        carried_over_address: addressCarriedOver ? carriedAddress : null
       };
     }
   } else if (toolName === 'cancel_appointment') {
@@ -220,7 +243,10 @@ WHAT YOU KNOW ABOUT THIS CUSTOMER:
 ${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
 
 CRITICAL GROUNDING RULE:
-You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation (e.g. an appointment that's already confirmed stays confirmed - don't second-guess it). Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result - never reformat, shorten, lengthen, or modify it in any way.
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result - never reformat, shorten, lengthen, or modify it in any way.
+
+ADDRESS HANDLING:
+When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address" if this customer had a previous address on file (e.g. from a reschedule). If so, do NOT ask for the address again - just confirm it naturally, e.g. "You're all set, and we'll use the address on file: [address]." If address_carried_over is false, you must ask for the address before giving the confirmation code.
 
 CORE BEHAVIOR RULES:
 1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
@@ -231,8 +257,8 @@ CORE BEHAVIOR RULES:
 6. Present at most 3 options using the EXACT wording/times the tool returned.
 7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters. Keep trying reasonable alternatives before giving up.
 8. Once the customer confirms a specific slot, call book_appointment with the exact start_time_iso from the tool result you showed them.
-9. After book_appointment succeeds, ask for the service address BEFORE mentioning any confirmation code: "You're booked in! What's the address for the visit?"
-10. When the customer gives an address, call save_customer_info, then state the confirmation code EXACTLY as returned by book_appointment, and the appointment time EXACTLY as returned. Use the phrase "confirmation code is" followed by the exact code value.
+9. After book_appointment succeeds, check if address_carried_over is true. If false, ask for the service address BEFORE mentioning any confirmation code. If true, mention the carried-over address naturally and proceed straight to the confirmation code.
+10. When the customer gives a NEW address (when not carried over), call save_customer_info, then state the confirmation code EXACTLY as returned by book_appointment, and the appointment time EXACTLY as returned. Use the phrase "confirmation code is" followed by the exact code value.
 11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code exactly as returned by book_appointment.
 12. If the customer wants to cancel, call cancel_appointment, then only confirm cancellation if the tool result shows success:true.
 13. For questions answerable from business information, answer directly.
@@ -240,7 +266,7 @@ CORE BEHAVIOR RULES:
 15. Never claim to be human if asked.
 16. Never repeat a message already sent in this conversation.
 17. Acknowledge urgency briefly, then prioritize booking quickly.
-18. If a customer already has a confirmed appointment and asks something unrelated (like "when will someone call me" or general questions), just answer naturally - never imply their existing appointment might not be confirmed.
+18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally - never imply their existing appointment might not be confirmed.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -256,6 +282,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     appointmentLabel: null,
     addressSavedThisTurn: false,
     addressSaveFailed: false,
+    addressCarriedOverThisTurn: false,
     cancelledThisTurn: false,
     cancelFailed: false,
   };
@@ -290,6 +317,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
           verifiedFacts.bookedThisTurn = true;
           verifiedFacts.confirmationCode = result.confirmation_code;
           verifiedFacts.appointmentLabel = result.appointment_label;
+          verifiedFacts.addressCarriedOverThisTurn = !!result.address_carried_over;
         }
       }
       if (toolUse.name === 'save_customer_info') {
@@ -342,9 +370,18 @@ Respond naturally. Use tools whenever you need real information or need to take 
       finalText = finalText.replace(codeMatch[0], `confirmation code is ${verifiedFacts.confirmationCode}`);
       guardrailTriggered = true;
     } else if (!codeMatch) {
-      // Claude booked successfully but never mentioned the code at all - append it to be safe
-      console.error(`[GUARDRAIL] lead=${lead.id} Booking succeeded but no confirmation code was mentioned in the response. Appending it.`);
+      console.error(`[GUARDRAIL] lead=${lead.id} Booking succeeded but no confirmation code was mentioned. Appending it.`);
       finalText = `${finalText} Your confirmation code is ${verifiedFacts.confirmationCode}.`;
+      guardrailTriggered = true;
+    }
+  }
+
+  // 2b. If address was carried over but never actually saved (sanity check), force a needs_followup flag
+  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !verifiedFacts.addressSavedThisTurn) {
+    const claimsHasAddress = /at \d+.*lane|at \d+.*street|at \d+.*ave|address on file|we'?ll use the address/i.test(finalText);
+    if (claimsHasAddress) {
+      console.error(`[GUARDRAIL] lead=${lead.id} Claude referenced an address with no verified save or carry-over this turn.`);
+      updateLead(lead.id, { status: 'needs_followup' });
       guardrailTriggered = true;
     }
   }
@@ -360,9 +397,9 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 4. Address confirmation claims without verified save this turn
+  // 4. Address confirmation claims without verified save or carry-over this turn
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
-  if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !leadAlreadyScheduled) {
+  if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result. Text was: "${finalText}"`);
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
