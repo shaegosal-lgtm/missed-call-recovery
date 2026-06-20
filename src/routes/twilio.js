@@ -10,8 +10,28 @@ const { sendLeadNotification } = require('../services/emailService');
 const twilioAuth = require('../middleware/twilioAuth');
 
 async function sendAndLog(leadId, to, message) {
-  await sendSMS(to, message);
+  try {
+    await sendSMS(to, message);
+  } catch (err) {
+    console.error('[sendAndLog] Failed to send SMS, but continuing:', err.message || err);
+  }
   if (leadId) appendToConversation(leadId, 'assistant', message);
+}
+
+async function safeNotifyOwner(leadData) {
+  try {
+    await notifyOwner(leadData);
+  } catch (err) {
+    console.error('[safeNotifyOwner] Failed, but continuing:', err.message || err);
+  }
+}
+
+async function safeSendLeadNotification(business, leadData, appointmentDetails) {
+  try {
+    await sendLeadNotification(business, leadData, appointmentDetails);
+  } catch (err) {
+    console.error('[safeSendLeadNotification] Failed, but continuing:', err.message || err);
+  }
 }
 
 router.post('/missed-call', twilioAuth, async (req, res) => {
@@ -49,7 +69,11 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
       const bizName = business ? business.name : 'us';
       const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
 
-      await sendSMS(From, firstMessage);
+      try {
+        await sendSMS(From, firstMessage);
+      } catch (smsErr) {
+        console.error('[missed-call] Failed to send initial SMS:', smsErr.message || smsErr);
+      }
       appendToConversation(leadId, 'assistant', firstMessage);
       console.log(`SMS sent to ${From}`);
     } catch (err) {
@@ -75,7 +99,11 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
       const bizName = business ? business.name : 'us';
       const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
 
-      await sendSMS(From, firstMessage);
+      try {
+        await sendSMS(From, firstMessage);
+      } catch (smsErr) {
+        console.error('[missed-call-fallback] Failed to send initial SMS:', smsErr.message || smsErr);
+      }
       appendToConversation(leadId, 'assistant', firstMessage);
       console.log(`SMS sent to ${From} after forwarding failed`);
     } catch (err) {
@@ -92,7 +120,11 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   const lead = getLeadByPhone(From);
   if (!lead) {
-    await sendSMS(From, `Thanks for reaching out! Please call us and we will be happy to help.`);
+    try {
+      await sendSMS(From, `Thanks for reaching out! Please call us and we will be happy to help.`);
+    } catch (err) {
+      console.error('[sms-reply] Failed to send no-lead SMS:', err.message || err);
+    }
     return res.status(200).send('<Response></Response>');
   }
 
@@ -107,16 +139,16 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     lead.reason = text;
 
     classifyLead(From, text)
-      .then(result => {
+      .then(async result => {
         updateLead(lead.id, {
           urgency: result.urgency,
           lead_type: result.lead_type,
           ai_summary: result.summary,
         });
-        notifyOwner({ ...lead, reason: text, ...result });
-        sendLeadNotification(business || { name: 'the business' }, { ...lead, reason: text, ...result });
+        await safeNotifyOwner({ ...lead, reason: text, ...result });
+        await safeSendLeadNotification(business || { name: 'the business' }, { ...lead, reason: text, ...result });
       })
-      .catch(err => console.error('Classification failed:', err));
+      .catch(err => console.error('[sms-reply] Classification chain failed:', err.message || err));
   }
 
   if (!business) {
@@ -133,12 +165,12 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       const codeMatch = reply.match(/confirmation code:?\s*([a-z0-9]+)/i);
       const code = codeMatch ? codeMatch[1] : null;
       if (code) {
-        await notifyOwner({ ...lead, ai_summary: `Appointment booked. Code: ${code}` });
-        await sendLeadNotification(business, { ...lead, ai_summary: `Appointment booked. Code: ${code}` }, code);
+        await safeNotifyOwner({ ...lead, ai_summary: `Appointment booked. Code: ${code}` });
+        await safeSendLeadNotification(business, { ...lead, ai_summary: `Appointment booked. Code: ${code}` }, code);
       }
     }
   } catch (err) {
-    console.error('Receptionist conversation failed:', err);
+    console.error('[sms-reply] Receptionist conversation failed:', err.message || err);
     await sendAndLog(lead.id, From, `Sorry, something went wrong on our end. A team member will reach out to help you shortly.`);
     updateLead(lead.id, { status: 'needs_followup' });
   }
