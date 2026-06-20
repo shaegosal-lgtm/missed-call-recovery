@@ -15,7 +15,7 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const TOOLS = [
   {
     name: 'check_availability',
-    description: 'Check real available appointment slots for a specific date. Always use this before telling a customer about availability - never guess or make up times. Returns up to 5 available time slots for that date, or the next available date if none are open.',
+    description: 'Check real available appointment slots for a specific date. Always use this before telling a customer about availability - never guess or make up times. Returns up to 5 available time slots, each with a slot_id you must use later to book.',
     input_schema: {
       type: 'object',
       properties: {
@@ -34,16 +34,16 @@ const TOOLS = [
   },
   {
     name: 'book_appointment',
-    description: 'Book a specific appointment slot. Only call after the customer explicitly confirms a specific date/time that was returned from check_availability. If the customer had a previous appointment with an address already on file (e.g. during a reschedule), that address will be automatically carried over - you do not need to ask again unless the carried-over address was not found.',
+    description: 'Book a specific appointment slot using its slot_id. You must use the exact slot_id returned by a previous check_availability call for the slot the customer chose - never type out or guess a timestamp yourself.',
     input_schema: {
       type: 'object',
       properties: {
-        start_time_iso: {
+        slot_id: {
           type: 'string',
-          description: 'The exact ISO timestamp of the slot to book, taken directly from a previous check_availability result.'
+          description: 'The exact slot_id value from a previous check_availability result, corresponding to the time the customer confirmed.'
         }
       },
-      required: ['start_time_iso']
+      required: ['slot_id']
     }
   },
   {
@@ -74,6 +74,22 @@ const TOOLS = [
     }
   }
 ];
+
+// Server-side cache mapping slot_id -> real ISO timestamp, scoped per conversation turn
+// This guarantees Claude can never type out or corrupt a timestamp itself
+const slotCache = new Map();
+
+function cacheSlot(leadId, isoString) {
+  const slotId = `slot_${Math.random().toString(36).substring(2, 10)}`;
+  const key = `${leadId}:${slotId}`;
+  slotCache.set(key, isoString);
+  return slotId;
+}
+
+function resolveSlot(leadId, slotId) {
+  const key = `${leadId}:${slotId}`;
+  return slotCache.get(key) || null;
+}
 
 async function classifyLead(phone, reason) {
   const prompt = `You are helping a small appointment-based business qualify missed call leads.
@@ -108,7 +124,6 @@ function logToolCall(leadId, toolName, input, result) {
 }
 
 function findMostRecentAddressForPhone(phone) {
-  // Look up the most recent appointment (any status) for this phone number that has a saved address
   const row = db.prepare(`
     SELECT a.service_address FROM appointments a
     JOIN leads l ON a.lead_id = l.id
@@ -136,56 +151,63 @@ function executeToolCall(toolName, toolInput, context) {
         result = { available: false, message: 'No availability in the next two weeks.' };
       } else {
         const next = available[0];
+        const offeredSlots = next.slots.slice(0, 5);
         result = {
           available: true,
           requested_date_had_availability: false,
           next_available_date: next.date,
           next_available_date_formatted: formatDate(next.date),
-          slots: next.slots.slice(0, 5).map(s => ({
-            start_time_iso: s.start.toISOString(),
+          slots: offeredSlots.map(s => ({
+            slot_id: cacheSlot(lead.id, s.start.toISOString()),
             label: s.label
           }))
         };
       }
     } else {
+      const offeredSlots = slots.slice(0, 5);
       result = {
         available: true,
         requested_date_had_availability: true,
         date_formatted: formatDate(date),
-        slots: slots.slice(0, 5).map(s => ({
-          start_time_iso: s.start.toISOString(),
+        slots: offeredSlots.map(s => ({
+          slot_id: cacheSlot(lead.id, s.start.toISOString()),
           label: s.label
         }))
       };
     }
   } else if (toolName === 'book_appointment') {
-    const bookResult = bookAppointment(business.id, lead.id, toolInput.start_time_iso);
-    if (!bookResult.success) {
-      result = { success: false, message: 'That slot was just taken by someone else.' };
+    const realIso = resolveSlot(lead.id, toolInput.slot_id);
+    if (!realIso) {
+      result = { success: false, message: 'That slot reference is no longer valid. Please check availability again.' };
     } else {
-      updateLead(lead.id, { status: 'scheduled' });
-      const startDate = new Date(toolInput.start_time_iso);
-      const label = startDate.toLocaleString('en-US', {
-        weekday: 'long', month: 'long', day: 'numeric',
-        hour: 'numeric', minute: '2-digit'
-      });
+      const bookResult = bookAppointment(business.id, lead.id, realIso);
+      if (!bookResult.success) {
+        result = { success: false, message: 'That slot was just taken by someone else.' };
+      } else {
+        updateLead(lead.id, { status: 'scheduled' });
+        const startDate = new Date(realIso);
+        const label = startDate.toLocaleString('en-US', {
+          weekday: 'long', month: 'long', day: 'numeric',
+          hour: 'numeric', minute: '2-digit',
+          timeZone: 'UTC'
+        });
 
-      // Carry over address from a previous appointment under this phone number, if one exists
-      const carriedAddress = findMostRecentAddressForPhone(From);
-      let addressCarriedOver = false;
-      if (carriedAddress) {
-        db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
-          .run(carriedAddress, bookResult.appointmentId);
-        addressCarriedOver = true;
+        const carriedAddress = findMostRecentAddressForPhone(From);
+        let addressCarriedOver = false;
+        if (carriedAddress) {
+          db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
+            .run(carriedAddress, bookResult.appointmentId);
+          addressCarriedOver = true;
+        }
+
+        result = {
+          success: true,
+          confirmation_code: bookResult.confirmationCode,
+          appointment_label: label,
+          address_carried_over: addressCarriedOver,
+          carried_over_address: addressCarriedOver ? carriedAddress : null
+        };
       }
-
-      result = {
-        success: true,
-        confirmation_code: bookResult.confirmationCode,
-        appointment_label: label,
-        address_carried_over: addressCarriedOver,
-        carried_over_address: addressCarriedOver ? carriedAddress : null
-      };
     }
   } else if (toolName === 'cancel_appointment') {
     const appt = getAppointmentByPhone(From);
@@ -243,10 +265,13 @@ WHAT YOU KNOW ABOUT THIS CUSTOMER:
 ${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
 
 CRITICAL GROUNDING RULE:
-You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result - never reformat, shorten, lengthen, or modify it in any way.
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result.
+
+SLOT BOOKING RULE - VERY IMPORTANT:
+When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result - never type out a date/time yourself as the identifier. Each available time slot has a slot_id like "slot_a8x92k1m" - use that exact value, matched to the label/time the customer confirmed. Never construct, guess, or modify a slot_id.
 
 ADDRESS HANDLING:
-When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address" if this customer had a previous address on file (e.g. from a reschedule). If so, do NOT ask for the address again - just confirm it naturally, e.g. "You're all set, and we'll use the address on file: [address]." If address_carried_over is false, you must ask for the address before giving the confirmation code.
+When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address" if this customer had a previous address on file. If so, do NOT ask for the address again - just confirm it naturally. If address_carried_over is false, you must ask for the address before giving the confirmation code.
 
 CORE BEHAVIOR RULES:
 1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
@@ -256,10 +281,10 @@ CORE BEHAVIOR RULES:
 5. When a customer wants to book: figure out the actual date using today's date above, then call check_availability. Never state times without calling this tool first.
 6. Present at most 3 options using the EXACT wording/times the tool returned.
 7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters. Keep trying reasonable alternatives before giving up.
-8. Once the customer confirms a specific slot, call book_appointment with the exact start_time_iso from the tool result you showed them.
+8. Once the customer confirms a specific slot, call book_appointment with the matching slot_id from the check_availability result you showed them.
 9. After book_appointment succeeds, check if address_carried_over is true. If false, ask for the service address BEFORE mentioning any confirmation code. If true, mention the carried-over address naturally and proceed straight to the confirmation code.
-10. When the customer gives a NEW address (when not carried over), call save_customer_info, then state the confirmation code EXACTLY as returned by book_appointment, and the appointment time EXACTLY as returned. Use the phrase "confirmation code is" followed by the exact code value.
-11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code exactly as returned by book_appointment.
+10. When the customer gives a NEW address, call save_customer_info, then state the confirmation code EXACTLY as returned, and the appointment time EXACTLY as returned in appointment_label.
+11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code exactly as returned.
 12. If the customer wants to cancel, call cancel_appointment, then only confirm cancellation if the tool result shows success:true.
 13. For questions answerable from business information, answer directly.
 14. For anything you cannot answer, call flag_needs_followup, then let them know a team member will follow up.
@@ -352,7 +377,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // 1. NEW booking confirmation claims without verified booking this turn
   const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
 
   if (claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
@@ -362,7 +386,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 2. Wrong or fabricated confirmation code mentioned (only relevant if we just booked this turn)
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.confirmationCode) {
     const codeMatch = /confirmation code\s*(?:is|:)?\s*#?([a-z0-9\-]+)/i.exec(finalText);
     if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== verifiedFacts.confirmationCode.toUpperCase().replace(/-/g, '')) {
@@ -376,17 +399,21 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // 2b. If address was carried over but never actually saved (sanity check), force a needs_followup flag
-  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !verifiedFacts.addressSavedThisTurn) {
-    const claimsHasAddress = /at \d+.*lane|at \d+.*street|at \d+.*ave|address on file|we'?ll use the address/i.test(finalText);
-    if (claimsHasAddress) {
-      console.error(`[GUARDRAIL] lead=${lead.id} Claude referenced an address with no verified save or carry-over this turn.`);
-      updateLead(lead.id, { status: 'needs_followup' });
-      guardrailTriggered = true;
+  // Verify the stated appointment time matches the real verified label - catches any remaining drift
+  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
+    const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
+    if (timeWordsInLabel) {
+      const realTime = timeWordsInLabel[0].toUpperCase().replace(/\s/g, '');
+      const allTimesInText = finalText.match(/\d{1,2}:\d{2}\s*[AP]M/gi) || [];
+      const hasMismatch = allTimesInText.some(t => t.toUpperCase().replace(/\s/g, '') !== realTime);
+      if (hasMismatch) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Time mismatch detected. Real time: ${realTime}, text contains: ${allTimesInText.join(', ')}`);
+        updateLead(lead.id, { status: 'needs_followup' });
+        guardrailTriggered = true;
+      }
     }
   }
 
-  // 3. Cancellation claims without verified cancellation this turn
   const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
   if (!guardrailTriggered && claimsCancellation && !verifiedFacts.cancelledThisTurn) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result. Text was: "${finalText}"`);
@@ -397,7 +424,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 4. Address confirmation claims without verified save or carry-over this turn
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
   if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result. Text was: "${finalText}"`);
