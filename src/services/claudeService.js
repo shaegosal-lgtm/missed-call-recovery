@@ -1,6 +1,88 @@
 const Anthropic = require('@anthropic-ai/sdk');
+const {
+  getAvailableSlots,
+  getNextAvailableDays,
+  bookAppointment,
+  cancelAppointment,
+  getAppointmentByPhone,
+  formatDate,
+} = require('./schedulingService');
+const { updateLead } = require('./leadService');
+const db = require('../db/db');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const TOOLS = [
+  {
+    name: 'check_availability',
+    description: 'Check real available appointment slots for a specific date. Always use this before telling a customer about availability - never guess or make up times. Returns up to 5 available time slots for that date, or the next available date if none are open.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date: {
+          type: 'string',
+          description: 'The date to check in YYYY-MM-DD format. Calculate this based on what the customer said (e.g. if they say "tuesday" figure out the actual upcoming Tuesday date, if "next tuesday" skip to the following week).'
+        },
+        time_of_day: {
+          type: 'string',
+          enum: ['morning', 'afternoon', 'evening', 'any'],
+          description: 'Filter by time of day if the customer specified a preference, otherwise use "any".'
+        }
+      },
+      required: ['date', 'time_of_day']
+    }
+  },
+  {
+    name: 'book_appointment',
+    description: 'Book a specific appointment slot for the customer. Only call this after the customer has explicitly confirmed a specific date and time that was returned from check_availability. Never call this with a time that was not confirmed available.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_time_iso: {
+          type: 'string',
+          description: 'The exact ISO timestamp of the slot to book, taken directly from a previous check_availability result.'
+        }
+      },
+      required: ['start_time_iso']
+    }
+  },
+  {
+    name: 'cancel_appointment',
+    description: 'Cancel the customer\'s existing appointment. Call this when the customer wants to cancel.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'save_customer_info',
+    description: 'Save the customer service address when they provide it. Call this as soon as the customer gives their address for the appointment.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: 'string',
+          description: 'The full service address the customer provided.'
+        }
+      },
+      required: ['address']
+    }
+  },
+  {
+    name: 'flag_needs_followup',
+    description: 'Flag this conversation as needing human follow-up. Call this ONLY when the customer is asking something that genuinely cannot be answered with the business information provided, or explicitly wants to speak to a human, or the request is too complex for you to handle (e.g. complex pricing negotiations, complaints, multi-service requests). Do not call this for normal booking flow.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Brief reason why human follow-up is needed.'
+        }
+      },
+      required: ['reason']
+    }
+  }
+];
 
 async function classifyLead(phone, reason) {
   const prompt = `You are helping a small appointment-based business qualify missed call leads.
@@ -30,115 +112,189 @@ Urgency guide: high = pain/emergency/urgent, medium = wants appointment soon, lo
   }
 }
 
-async function getReceptionistResponse(business, lead, conversationHistory, customerMessage) {
+function executeToolCall(toolName, toolInput, context) {
+  const { business, lead, From } = context;
+
+  if (toolName === 'check_availability') {
+    const { date, time_of_day } = toolInput;
+    let slots = getAvailableSlots(business.id, date);
+
+    if (time_of_day === 'morning') slots = slots.filter(s => s.slotHour < 12);
+    else if (time_of_day === 'afternoon') slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
+    else if (time_of_day === 'evening') slots = slots.filter(s => s.slotHour >= 17);
+
+    if (slots.length === 0) {
+      const available = getNextAvailableDays(business.id, 14);
+      if (available.length === 0) {
+        return { available: false, message: 'No availability in the next two weeks.' };
+      }
+      const next = available[0];
+      return {
+        available: true,
+        requested_date_had_availability: false,
+        next_available_date: next.date,
+        next_available_date_formatted: formatDate(next.date),
+        slots: next.slots.slice(0, 5).map(s => ({
+          start_time_iso: s.start.toISOString(),
+          label: s.label
+        }))
+      };
+    }
+
+    return {
+      available: true,
+      requested_date_had_availability: true,
+      date_formatted: formatDate(date),
+      slots: slots.slice(0, 5).map(s => ({
+        start_time_iso: s.start.toISOString(),
+        label: s.label
+      }))
+    };
+  }
+
+  if (toolName === 'book_appointment') {
+    const result = bookAppointment(business.id, lead.id, toolInput.start_time_iso);
+    if (!result.success) {
+      return { success: false, message: 'That slot was just taken by someone else.' };
+    }
+    updateLead(lead.id, { status: 'scheduled' });
+    const startDate = new Date(toolInput.start_time_iso);
+    const label = startDate.toLocaleString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric',
+      hour: 'numeric', minute: '2-digit'
+    });
+    return {
+      success: true,
+      confirmation_code: result.confirmationCode,
+      appointment_label: label
+    };
+  }
+
+  if (toolName === 'cancel_appointment') {
+    const appt = getAppointmentByPhone(From);
+    if (!appt) {
+      return { success: false, message: 'No active appointment found for this customer.' };
+    }
+    cancelAppointment(appt.id);
+    return { success: true };
+  }
+
+  if (toolName === 'save_customer_info') {
+    const appt = getAppointmentByPhone(From);
+    if (appt) {
+      db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
+        .run(toolInput.address, appt.id);
+    }
+    updateLead(lead.id, { status: 'scheduled' });
+    return { success: true };
+  }
+
+  if (toolName === 'flag_needs_followup') {
+    updateLead(lead.id, { status: 'needs_followup' });
+    return { success: true, flagged: true };
+  }
+
+  return { error: 'Unknown tool' };
+}
+
+async function runReceptionistConversation(business, lead, conversationHistory, customerMessage, From) {
   const businessInfo = business.business_info || 'No specific business information provided.';
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const dayName = today.toLocaleDateString('en-US', { weekday: 'long' });
 
   const filteredHistory = conversationHistory
-    .filter(m => !m.body.includes('"pendingSlots"'))
-    .map(m => `${m.role === 'customer' ? 'Customer' : 'You'}: ${m.body}`)
-    .join('\n');
+    .filter(m => m.role === 'customer' || m.role === 'assistant')
+    .map(m => ({
+      role: m.role === 'customer' ? 'user' : 'assistant',
+      content: m.body
+    }));
 
-  const alreadySaidFollowUp = filteredHistory.toLowerCase().includes('team member') ||
-    filteredHistory.toLowerCase().includes('follow up') ||
-    filteredHistory.toLowerCase().includes('get back to you') ||
-    filteredHistory.toLowerCase().includes('be in touch');
+  const systemPrompt = `You are an automated AI receptionist for ${business.name}, a service business. You communicate with customers via SMS after they had a missed call.
 
-  const systemPrompt = `You are an automated SMS assistant for ${business.name} following up on a missed call.
+TODAY'S DATE: ${dayName}, ${todayStr}
 
 BUSINESS INFORMATION:
 ${businessInfo}
 
 WHAT YOU KNOW ABOUT THIS CUSTOMER:
 - Phone: ${lead.phone} (never ask for this)
-- Name: ${lead.name || 'not yet collected'}
-- Reason for calling: ${lead.reason || 'not yet collected'}
+- Reason for calling: ${lead.reason || 'not yet known'}
 
-RULES:
-1. No emojis. Professional and warm tone.
-2. Under 160 characters per message.
-3. One question per message only.
-4. Never mention specific times or available slots — the booking system handles that.
-5. Never ask for their phone number — you have it.
-6. Never repeat yourself.
-7. Never use bullet points or lists.
-8. Speak naturally and warmly.
-9. For anything not in the business information above, say "I will have someone from our team reach out to you about that" — but only say this ONCE. ${alreadySaidFollowUp ? 'You have already said this. Do NOT say it again. Instead ask if they would like to book an appointment.' : ''}
-10. Never ask for a name unless the customer has already confirmed a booking.
-11. After telling the customer a team member will follow up on something, always follow up with "Would you like to book an appointment in the meantime?"
-12. If the customer declines to book, end warmly: "No problem, a team member will be in touch shortly."
-13. If the business information answers their question — answer it directly, then ask if they would like to book.
-14. If the customer wants to book — ask "What day works best for you?" and nothing else about times.
-15. CRITICAL: If a customer asks to speak to a human or a real person, never claim to be human. Say "This is an automated assistant. A team member will call you back shortly. Would you like to book an appointment in the meantime?"
-16. Never lie or mislead the customer about being an AI or automated system.
+YOUR CAPABILITIES:
+You have tools to check real appointment availability and book appointments. You must NEVER state a specific date or time unless you just received it from the check_availability tool. Never guess, estimate, or make up availability.
 
-CONVERSATION SO FAR:
-${filteredHistory}
+CORE BEHAVIOR RULES:
+1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
+2. Keep messages under 320 characters (about 2 SMS segments). Be concise.
+3. No emojis.
+4. One question at a time - never ask multiple things in one message.
+5. When a customer wants to book: figure out what date they mean (convert relative dates like "tuesday", "next tuesday", "tomorrow", "asap" into an actual YYYY-MM-DD date using today's date above), then call check_availability.
+6. Present at most 3 options clearly, e.g. "I have Tuesday at 9am, 11am, or 2pm - which works?"
+7. If the customer rejects all options or asks for different times (later, earlier, different day, etc) - call check_availability again with adjusted parameters. Keep trying to find something that works. Do NOT give up and say "a team member will follow up" unless you have tried multiple reasonable options and the customer still cannot find anything that works, or there is truly no availability.
+8. Once the customer agrees to a specific slot, call book_appointment immediately with that exact start_time_iso.
+9. After successfully booking, before confirming, ask for the service address: "Great, you're booked in! What's the address for the visit?" Do NOT give the confirmation code yet.
+10. When the customer gives an address, call save_customer_info, then give them the confirmation code and a warm confirmation message.
+11. If the customer wants to skip giving an address and prefers a callback, that's fine - call flag_needs_followup with that reason, and let them know a team member will confirm the address before the visit, still giving them the confirmation code.
+12. If the customer wants to cancel, call cancel_appointment.
+13. For questions you can answer from the business information above, answer directly and naturally.
+14. For questions you genuinely cannot answer from the business info (pricing not listed, complex multi-service requests, complaints, explicit requests for a human) - call flag_needs_followup and let the customer know a team member will be in touch, then offer to still help them book an appointment in the meantime if relevant.
+15. Never claim to be a human if asked - be honest that you're an automated assistant, while remaining warm and helpful.
+16. Never repeat a message you've already sent in this conversation.
+17. If a customer seems to be in an urgent/emergency situation, acknowledge it briefly and prioritize getting them booked quickly.
 
-Customer: "${customerMessage}"
+Respond naturally as the receptionist. Use tools whenever you need real information or need to take an action - never simulate or guess what a tool would return.`;
 
-Your reply (one short natural message, no emojis):`;
+  const messages = [...filteredHistory, { role: 'user', content: customerMessage }];
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 200,
-    messages: [{ role: 'user', content: systemPrompt }],
-  });
+  let finalText = '';
+  let iterations = 0;
+  const maxIterations = 5;
 
-  return response.content[0].text.trim();
-}
+  while (iterations < maxIterations) {
+    iterations++;
 
-async function analyzeIntent(message, conversationHistory) {
-  const prompt = `Analyze this SMS message from a customer contacting a business after a missed call.
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools: TOOLS,
+      messages,
+    });
 
-Message: "${message}"
-Recent conversation: ${JSON.stringify(conversationHistory.slice(-6))}
+    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+    const textBlocks = response.content.filter(b => b.type === 'text');
 
-Return ONLY this JSON with no explanation or markdown:
-{
-  "wants_to_book": true or false,
-  "wants_to_cancel": true or false,
-  "wants_to_reschedule": true or false,
-  "selecting_slot": true or false,
-  "slot_number": 1 or 2 or 3 or null,
-  "preferred_day": "monday/tuesday/wednesday/thursday/friday/saturday/sunday/tomorrow/today or null",
-  "is_next_week": true or false,
-  "time_preference": "morning/afternoon/evening or null",
-  "is_wrong_number": true or false,
-  "has_name": true or false,
-  "name": "extracted name or null"
-}
+    if (toolUseBlocks.length === 0) {
+      finalText = textBlocks.map(b => b.text).join(' ').trim();
+      break;
+    }
 
-RULES:
-- preferred_day: extract ONLY the day name (monday, tuesday, etc). Never calculate or return a date.
-- is_next_week: set true ONLY if the message contains the word "next" before the day name (e.g. "next tuesday", "next monday"). Otherwise false.
-- wants_to_book: true if customer mentions any day, time preference, or wanting to schedule/book/come in.
-- selecting_slot: true if message is just 1, 2, or 3 AND slots were recently offered in the conversation.
-- has_name: true if message contains what appears to be a person's name.
-- name: extract the person's name if present, otherwise null.`;
+    messages.push({ role: 'assistant', content: response.content });
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 200,
-    messages: [{ role: 'user', content: prompt }],
-  });
+    const toolResults = [];
+    for (const toolUse of toolUseBlocks) {
+      const result = executeToolCall(toolUse.name, toolUse.input, { business, lead, From });
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(result)
+      });
+    }
 
-  try {
-    return JSON.parse(response.content[0].text);
-  } catch {
-    return {
-      wants_to_book: false,
-      wants_to_cancel: false,
-      wants_to_reschedule: false,
-      selecting_slot: false,
-      slot_number: null,
-      preferred_day: null,
-      is_next_week: false,
-      time_preference: null,
-      is_wrong_number: false,
-      has_name: false,
-      name: null
-    };
+    messages.push({ role: 'user', content: toolResults });
+
+    if (response.stop_reason !== 'tool_use') {
+      finalText = textBlocks.map(b => b.text).join(' ').trim();
+      break;
+    }
   }
+
+  if (!finalText) {
+    finalText = "Thanks for your patience! A team member will follow up with you shortly.";
+  }
+
+  return finalText;
 }
 
-module.exports = { classifyLead, getReceptionistResponse, analyzeIntent };
+module.exports = { classifyLead, runReceptionistConversation };
