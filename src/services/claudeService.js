@@ -21,7 +21,7 @@ const TOOLS = [
       properties: {
         date: {
           type: 'string',
-          description: 'The date to check in YYYY-MM-DD format. Calculate this based on what the customer said.'
+          description: 'The date to check in YYYY-MM-DD format. You MUST copy this exactly from the DATE LOOKUP TABLE provided in your instructions - never calculate this yourself.'
         },
         time_of_day: {
           type: 'string',
@@ -87,6 +87,28 @@ function cacheSlot(leadId, isoString) {
 function resolveSlot(leadId, slotId) {
   const key = `${leadId}:${slotId}`;
   return slotCache.get(key) || null;
+}
+
+// Builds an explicit lookup table mapping day names and relative terms to real YYYY-MM-DD dates
+// This removes ALL date math responsibility from Claude - it can only ever pick from this list
+function buildDateLookupTable() {
+  const today = new Date();
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const lines = [];
+
+  for (let i = 0; i <= 20; i++) {
+    const d = new Date(today);
+    d.setUTCDate(today.getUTCDate() + i);
+    const dateStr = d.toISOString().split('T')[0];
+    const dayName = dayNames[d.getUTCDay()];
+
+    let label = `${dayName} ${dateStr}`;
+    if (i === 0) label += ' (TODAY)';
+    if (i === 1) label += ' (TOMORROW)';
+    lines.push(label);
+  }
+
+  return lines.join('\n');
 }
 
 async function classifyLead(phone, reason) {
@@ -240,6 +262,7 @@ async function runReceptionistConversation(business, lead, conversationHistory, 
   const today = new Date();
   const todayStr = today.toISOString().split('T')[0];
   const dayName = today.toLocaleDateString('en-US', { weekday: 'long' });
+  const dateLookupTable = buildDateLookupTable();
 
   const filteredHistory = conversationHistory
     .filter(m => m.role === 'customer' || m.role === 'assistant')
@@ -254,6 +277,11 @@ async function runReceptionistConversation(business, lead, conversationHistory, 
 
 TODAY'S DATE: ${dayName}, ${todayStr}
 
+DATE LOOKUP TABLE - YOU MUST USE THIS, NEVER CALCULATE DATES YOURSELF:
+${dateLookupTable}
+
+When a customer mentions a day (e.g. "Tuesday", "next Friday", "tomorrow"), find the matching line in the table above and use that EXACT date string for the check_availability tool. Do not do your own date math. Do not guess. If the customer says "next [day]", use the SECOND occurrence of that day name in the table (skip the first/nearest one). If they just say a day name with no "next", use the FIRST occurrence.
+
 BUSINESS INFORMATION:
 ${businessInfo}
 
@@ -263,10 +291,10 @@ WHAT YOU KNOW ABOUT THIS CUSTOMER:
 ${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
 
 CRITICAL GROUNDING RULE:
-You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result.
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details. When stating a confirmation code, copy it EXACTLY character-for-character from the tool result. When stating a day or date back to the customer, always use the exact date_formatted or appointment_label value from the tool result - never restate the day yourself from memory.
 
 SLOT BOOKING RULE - VERY IMPORTANT:
-When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result - never type out a date/time yourself as the identifier. Each available time slot has a slot_id like "slot_a8x92k1m" - use that exact value, matched to the label/time the customer confirmed. Never construct, guess, or modify a slot_id.
+When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result - never type out a date/time yourself as the identifier.
 
 ADDRESS HANDLING:
 When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address" if this customer had a previous address on file. If so, do NOT ask for the address again - just confirm it naturally. If address_carried_over is false, you must ask for the address before giving the confirmation code.
@@ -276,10 +304,10 @@ CORE BEHAVIOR RULES:
 2. Keep messages under 320 characters. Be concise.
 3. No emojis.
 4. One question at a time.
-5. When a customer wants to book: figure out the actual date using today's date above, then call check_availability. Never state times without calling this tool first.
+5. When a customer wants to book: find the correct date using the DATE LOOKUP TABLE above, then call check_availability with that exact date string.
 6. Present at most 3 options using the EXACT wording/times the tool returned.
 7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters. Keep trying reasonable alternatives before giving up.
-8. Once the customer confirms a specific slot, call book_appointment with the matching slot_id from the check_availability result you showed them.
+8. Once the customer confirms a specific slot, call book_appointment with the matching slot_id.
 9. After book_appointment succeeds, check if address_carried_over is true. If false, ask for the service address BEFORE mentioning any confirmation code. If true, mention the carried-over address naturally and proceed straight to the confirmation code.
 10. When the customer gives a NEW address, call save_customer_info, then state the confirmation code EXACTLY as returned, and the appointment time EXACTLY as returned in appointment_label.
 11. If the customer prefers a callback instead of an address, call flag_needs_followup, then state the confirmation code exactly as returned.
@@ -290,7 +318,7 @@ CORE BEHAVIOR RULES:
 16. Never repeat a message already sent in this conversation.
 17. Acknowledge urgency briefly, then prioritize booking quickly.
 18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally - never imply their existing appointment might not be confirmed.
-19. If a customer's message contains multiple pieces of information at once (name, address, day, time preference, reason, all together), carefully parse each piece separately before acting - especially the requested day. Double-check your interpretation of the day against TODAY'S DATE before calling check_availability, since compound messages are more error-prone. When stating the day back to the customer, always use the exact date_formatted or appointment_label value from the tool result, never your own restatement of what day you think it is.
+19. If a customer's message contains multiple pieces of information at once (name, address, day, time preference, reason, all together), carefully parse each piece separately before acting - especially the requested day, using the DATE LOOKUP TABLE.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -309,6 +337,8 @@ Respond naturally. Use tools whenever you need real information or need to take 
     addressCarriedOverThisTurn: false,
     cancelledThisTurn: false,
     cancelFailed: false,
+    lastCheckAvailabilityDate: null,
+    lastCheckAvailabilityDateFormatted: null,
   };
 
   while (iterations < maxIterations) {
@@ -336,6 +366,10 @@ Respond naturally. Use tools whenever you need real information or need to take 
     for (const toolUse of toolUseBlocks) {
       const result = executeToolCall(toolUse.name, toolUse.input, { business, lead, From });
 
+      if (toolUse.name === 'check_availability') {
+        verifiedFacts.lastCheckAvailabilityDate = toolUse.input.date;
+        verifiedFacts.lastCheckAvailabilityDateFormatted = result.date_formatted || result.next_available_date_formatted || null;
+      }
       if (toolUse.name === 'book_appointment') {
         if (result.success) {
           verifiedFacts.bookedThisTurn = true;
@@ -376,9 +410,28 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
+  // 0. Validate the day mentioned when presenting availability options matches what the tool actually checked
+  // This catches wrong-day bugs BEFORE a booking happens, not just after
+  if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn) {
+    const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
+    if (realDayMatch) {
+      const realDay = realDayMatch[1];
+      const dayPattern = /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi;
+      const daysInText = finalText.match(dayPattern) || [];
+      const hasDayMismatch = daysInText.length > 0 && daysInText.some(d => d.toLowerCase() !== realDay.toLowerCase());
+      if (hasDayMismatch) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Availability day mismatch BEFORE booking. Tool checked: ${realDay}, text says: ${daysInText.join(', ')}`);
+        updateLead(lead.id, { status: 'needs_followup' });
+        finalText = `Let me double check that for you - one moment. A team member will confirm available times shortly.`;
+        guardrailTriggered = true;
+      }
+    }
+  }
+
+  // 1. NEW booking confirmation claims without verified booking this turn
   const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
 
-  if (claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
+  if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed NEW booking confirmation with no verified tool result. Text was: "${finalText}"`);
     finalText = "Let me get that booked for you properly - one moment please.";
     updateLead(lead.id, { status: 'needs_followup' });
@@ -398,7 +451,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // Verify the stated appointment time AND day-of-week match the real verified label
+  // Verify the stated appointment time AND day-of-week match the real verified label (post-booking check)
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
     const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
     if (timeWordsInLabel) {
