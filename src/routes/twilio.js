@@ -34,6 +34,28 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
   }
 }
 
+// Runs classification ONCE, awaited, using the freshest conversation snapshot.
+// Only call this at clear conversation-state-changing moments to avoid race conditions
+// from multiple overlapping background classification calls overwriting each other.
+async function runClassificationSafely(From, lead, business) {
+  try {
+    const freshLead = getLeadByPhone(From) || lead;
+    const freshConvo = JSON.parse(freshLead.conversation || '[]');
+    const result = await classifyLead(From, freshConvo);
+
+    updateLead(lead.id, {
+      urgency: result.urgency,
+      lead_type: result.lead_type,
+      ai_summary: result.summary,
+    });
+
+    await safeNotifyOwner({ ...freshLead, ...result });
+    await safeSendLeadNotification(business || { name: 'the business' }, { ...freshLead, ...result });
+  } catch (err) {
+    console.error('[runClassificationSafely] Failed:', err.message || err);
+  }
+}
+
 router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
   console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
@@ -133,7 +155,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   appendToConversation(lead.id, 'customer', text);
 
-  // Save first message as reason if not set yet - this is the customer's FIRST response, moving them off "new"
   if (!lead.reason && text.length > 2) {
     updateLead(lead.id, { reason: text });
     lead.reason = text;
@@ -142,6 +163,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (!business) {
     await sendAndLog(lead.id, From, `Thanks for reaching out! A team member will get back to you shortly.`);
     updateLead(lead.id, { status: 'needs_followup' });
+    await runClassificationSafely(From, lead, business);
     return res.status(200).send('<Response></Response>');
   }
 
@@ -150,21 +172,19 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     reply = await runReceptionistConversation(business, lead, convo, text, From);
     await sendAndLog(lead.id, From, reply);
 
-    // Re-classify urgency using the FULL conversation now that it includes this turn's reply
-    const updatedConvo = JSON.parse(getLeadByPhone(From)?.conversation || '[]');
-    classifyLead(From, updatedConvo)
-      .then(async result => {
-        updateLead(lead.id, {
-          urgency: result.urgency,
-          lead_type: result.lead_type,
-          ai_summary: result.summary,
-        });
-        await safeNotifyOwner({ ...lead, ...result });
-        await safeSendLeadNotification(business, { ...lead, ...result });
-      })
-      .catch(err => console.error('[sms-reply] Classification failed:', err.message || err));
+    // Check if this turn changed the lead into a meaningful end-state - only classify at these moments
+    const leadAfterReply = getLeadByPhone(From);
+    const statusChanged = leadAfterReply && leadAfterReply.status !== lead.status;
+    const isMeaningfulMoment =
+      reply.toLowerCase().includes('confirmation code') ||
+      (leadAfterReply && leadAfterReply.status === 'needs_followup') ||
+      (leadAfterReply && leadAfterReply.status === 'closed') ||
+      statusChanged;
 
-    // If a booking just completed, send a dedicated owner notification with appointment details
+    if (isMeaningfulMoment) {
+      await runClassificationSafely(From, lead, business);
+    }
+
     if (reply.toLowerCase().includes('confirmation code')) {
       const codeMatch = reply.match(/confirmation code:?\s*(?:is)?\s*([a-z0-9]+)/i);
       const code = codeMatch ? codeMatch[1] : null;
@@ -177,6 +197,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     console.error('[sms-reply] Receptionist conversation failed:', err.message || err);
     await sendAndLog(lead.id, From, `Sorry, something went wrong on our end. A team member will reach out to help you shortly.`);
     updateLead(lead.id, { status: 'needs_followup' });
+    await runClassificationSafely(From, lead, business);
   }
 
   res.status(200).send('<Response></Response>');
