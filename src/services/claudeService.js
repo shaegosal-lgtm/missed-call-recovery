@@ -114,7 +114,6 @@ function buildDateLookupTable() {
   return lines.join('\n');
 }
 
-// Now takes the FULL conversation instead of a single message, for more meaningful urgency classification
 async function classifyLead(phone, conversationHistory) {
   const convoText = conversationHistory
     .filter(m => m.role === 'customer' || m.role === 'assistant')
@@ -312,6 +311,9 @@ ${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT
 CRITICAL GROUNDING RULE:
 You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details.
 
+HANDLING UNAVAILABLE DAYS:
+If a customer asks about a specific day and check_availability shows requested_date_had_availability: false, it means that day has no openings (it might not even be a business day). Be honest and natural about this: explain that day isn't available and offer the next_available_date_formatted instead. This is normal, expected behavior - not an error.
+
 SLOT BOOKING RULE:
 When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result.
 
@@ -319,7 +321,7 @@ ADDRESS HANDLING:
 When you call book_appointment, the result may include "address_carried_over": true and "carried_over_address". If so, do NOT ask for the address again. If false, ask for the address before giving the confirmation code.
 
 CLOSING A CONVERSATION:
-If the customer clearly declines service (says "not interested", "no thanks", "I'll go elsewhere", or similar, and is NOT booking an appointment), call mark_conversation_closed after responding warmly. Do not call this if they might still come back to book, or if you've flagged them for human follow-up - those stay open for the team.
+If the customer clearly declines service (says "not interested", "no thanks", "I'll go elsewhere", or similar, and is NOT booking an appointment), call mark_conversation_closed after responding warmly.
 
 CORE BEHAVIOR RULES:
 1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
@@ -361,6 +363,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     cancelFailed: false,
     lastCheckAvailabilityDate: null,
     lastCheckAvailabilityDateFormatted: null,
+    lastCheckHadRequestedAvailability: false,
     closedThisTurn: false,
   };
 
@@ -392,6 +395,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
       if (toolUse.name === 'check_availability') {
         verifiedFacts.lastCheckAvailabilityDate = toolUse.input.date;
         verifiedFacts.lastCheckAvailabilityDateFormatted = result.date_formatted || result.next_available_date_formatted || null;
+        verifiedFacts.lastCheckHadRequestedAvailability = result.requested_date_had_availability === true;
       }
       if (toolUse.name === 'book_appointment') {
         if (result.success) {
@@ -436,15 +440,18 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn) {
+  // 0. Validate AVAILABILITY CLAIMS match what was actually checked.
+  // Only fires when the tool confirmed the requested day WAS available but Claude states a DIFFERENT day as available.
+  // Does NOT fire when explaining a day is unavailable (which naturally mentions the unavailable day alongside the real one).
+  if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn && verifiedFacts.lastCheckHadRequestedAvailability) {
     const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
     if (realDayMatch) {
       const realDay = realDayMatch[1];
-      const dayPattern = /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi;
-      const daysInText = finalText.match(dayPattern) || [];
-      const hasDayMismatch = daysInText.length > 0 && daysInText.some(d => d.toLowerCase() !== realDay.toLowerCase());
-      if (hasDayMismatch) {
-        console.error(`[GUARDRAIL] lead=${lead.id} Availability day mismatch BEFORE booking. Tool checked: ${realDay}, text says: ${daysInText.join(', ')}`);
+      const availabilityClaimPattern = new RegExp(`(?:available|have|open).{0,30}(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)(?!.{0,15}(?:isn'?t|is not|not available|unavailable))`, 'gi');
+      const matches = [...finalText.matchAll(availabilityClaimPattern)];
+      const hasMismatch = matches.some(m => m[1].toLowerCase() !== realDay.toLowerCase());
+      if (hasMismatch) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Availability day mismatch BEFORE booking. Tool checked: ${realDay}, text claims availability for a different day.`);
         updateLead(lead.id, { status: 'needs_followup' });
         finalText = `Let me double check that for you - one moment. A team member will confirm available times shortly.`;
         guardrailTriggered = true;
