@@ -34,11 +34,6 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
   }
 }
 
-// Runs classification ONCE per call, awaited, using the freshest conversation snapshot.
-// Called at two key moments: (1) the customer's first substantive reply, so even abandoned
-// conversations get an early urgency signal, and (2) genuine ending moments (booked, flagged,
-// closed) to refine that signal with the full picture. Each moment only fires once per lead,
-// so this cannot race against itself.
 async function runClassificationSafely(From, lead, business) {
   try {
     const freshLead = getLeadByPhone(From) || lead;
@@ -76,8 +71,7 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
     }
     return res.status(200).type('text/xml').send(`
       <Response>
-        <Say>Thank you for calling. We are unable to take your call right now. Please stay on the line and we will follow up with you shortly.</Say>
-        <Pause length="20"/>
+        <Say>Thank you for calling. We are unable to take your call right now. We will text you in just a moment so we can help you right away.</Say>
         <Hangup/>
       </Response>
     `);
@@ -183,8 +177,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       (leadAfterReply && leadAfterReply.status === 'closed') ||
       statusChanged;
 
-    // Classify on the first real reply (early signal, even if conversation is abandoned)
-    // AND at meaningful ending moments (refines the signal with full context)
     if (isMeaningfulMoment || isFirstSubstantiveReply) {
       await runClassificationSafely(From, lead, business);
     }
