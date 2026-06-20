@@ -205,6 +205,8 @@ async function runReceptionistConversation(business, lead, conversationHistory, 
       content: m.body
     }));
 
+  const leadWasAlreadyScheduled = lead.status === 'scheduled';
+
   const systemPrompt = `You are an automated AI receptionist for ${business.name}, a service business. You communicate with customers via SMS after they had a missed call.
 
 TODAY'S DATE: ${dayName}, ${todayStr}
@@ -215,9 +217,10 @@ ${businessInfo}
 WHAT YOU KNOW ABOUT THIS CUSTOMER:
 - Phone: ${lead.phone} (never ask for this)
 - Reason for calling: ${lead.reason || 'not yet known'}
+${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
 
 CRITICAL GROUNDING RULE:
-You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain. Never guess, estimate, restate from memory, infer, or fabricate any of these details - even if it seems obvious or you said something similar before. If you are not 100% certain a value came directly from a tool result, do not state it - instead say you're confirming and will follow up, or ask a clarifying question.
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation (e.g. an appointment that's already confirmed stays confirmed - don't second-guess it). Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details.
 
 CORE BEHAVIOR RULES:
 1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
@@ -237,6 +240,7 @@ CORE BEHAVIOR RULES:
 15. Never claim to be human if asked.
 16. Never repeat a message already sent in this conversation.
 17. Acknowledge urgency briefly, then prioritize booking quickly.
+18. If a customer already has a confirmed appointment and asks something unrelated (like "when will someone call me" or general questions), just answer naturally - never imply their existing appointment might not be confirmed.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -320,16 +324,19 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // 1. Booking confirmation claims without verified booking
-  const claimsConfirmation = /confirmation code|you'?re booked|appointment is confirmed|booked in|all set/i.test(finalText);
-  if (claimsConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
-    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed booking confirmation with no verified tool result. Text was: "${finalText}"`);
-    finalText = "Let me confirm those details for you - one moment. A team member will follow up shortly to finalize your appointment.";
+  // 1. NEW booking confirmation claims without verified booking this turn
+  // Only fires if the lead was NOT already scheduled before this message
+  // Uses a tight regex to avoid false positives on casual follow-up language
+  const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code:/i.test(finalText);
+
+  if (claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed NEW booking confirmation with no verified tool result. Text was: "${finalText}"`);
+    finalText = "Let me get that booked for you properly - one moment please.";
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
   }
 
-  // 2. Wrong confirmation code mentioned
+  // 2. Wrong confirmation code mentioned (only relevant if we just booked this turn)
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.confirmationCode) {
     const codeMatch = /confirmation code:?\s*#?([a-z0-9\-]+)/i.exec(finalText);
     if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== verifiedFacts.confirmationCode.toUpperCase().replace(/-/g, '')) {
@@ -339,7 +346,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // 3. Cancellation claims without verified cancellation
+  // 3. Cancellation claims without verified cancellation this turn
   const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
   if (!guardrailTriggered && claimsCancellation && !verifiedFacts.cancelledThisTurn) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result. Text was: "${finalText}"`);
@@ -350,9 +357,10 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 4. Address confirmation claims without verified save
+  // 4. Address confirmation claims without verified save this turn
+  // Skip this check if address was already saved in a previous turn (lead already scheduled)
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
-  if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn) {
+  if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result. Text was: "${finalText}"`);
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
