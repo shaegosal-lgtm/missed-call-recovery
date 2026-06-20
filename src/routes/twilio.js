@@ -72,6 +72,7 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
     return res.status(200).type('text/xml').send(`
       <Response>
         <Say>Thank you for calling. We are unable to take your call right now. We will text you in just a moment so we can help you right away.</Say>
+        <Pause length="2"/>
         <Hangup/>
       </Response>
     `);
