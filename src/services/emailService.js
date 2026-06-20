@@ -98,7 +98,7 @@ async function sendLeadNotification(business, lead, appointmentDetails = null) {
     </html>
   `;
 
-  const fromAddress = 'MissedPro <onboarding@resend.dev>';
+  const fromAddress = 'MissedPro <notifications@mail.missedpro.com>';
 
   try {
     const result = await resend.emails.send({
