@@ -169,14 +169,33 @@ function logToolCall(leadId, toolName, input, result) {
   console.log(`[TOOL_CALL] lead=${leadId} tool=${toolName} input=${JSON.stringify(input)} result=${JSON.stringify(result)}`);
 }
 
+// ---- Schema-safe helpers -------------------------------------------------
+// The appointments table may or may not have service_address / address_confirmed
+// columns depending on migrations. Detect once so queries never throw.
+const appointmentColumns = (() => {
+  try {
+    return new Set(db.prepare(`PRAGMA table_info(appointments)`).all().map(c => c.name));
+  } catch {
+    return new Set();
+  }
+})();
+const HAS_SERVICE_ADDRESS = appointmentColumns.has('service_address');
+const HAS_ADDRESS_CONFIRMED = appointmentColumns.has('address_confirmed');
+
 function findMostRecentAddressForPhone(phone) {
-  const row = db.prepare(`
-    SELECT a.service_address FROM appointments a
-    JOIN leads l ON a.lead_id = l.id
-    WHERE l.phone = ? AND a.service_address IS NOT NULL AND a.address_confirmed = 1
-    ORDER BY a.created_at DESC LIMIT 1
-  `).get(phone);
-  return row ? row.service_address : null;
+  if (!HAS_SERVICE_ADDRESS) return null;
+  try {
+    const confirmedClause = HAS_ADDRESS_CONFIRMED ? 'AND a.address_confirmed = 1' : '';
+    const row = db.prepare(`
+      SELECT a.service_address FROM appointments a
+      JOIN leads l ON a.lead_id = l.id
+      WHERE l.phone = ? AND a.service_address IS NOT NULL ${confirmedClause}
+      ORDER BY a.created_at DESC LIMIT 1
+    `).get(phone);
+    return row ? row.service_address : null;
+  } catch {
+    return null;
+  }
 }
 
 function findMostRecentNameForPhone(phone) {
@@ -188,14 +207,39 @@ function findMostRecentNameForPhone(phone) {
   return row ? row.name : null;
 }
 
-function findActiveConfirmationCodeForPhone(phone) {
+// The single source of truth for an active booking: pulls the real
+// confirmation code AND real start_time straight from the database.
+function findActiveAppointmentForPhone(phone) {
   const row = db.prepare(`
-    SELECT a.confirmation_code FROM appointments a
+    SELECT a.confirmation_code, a.start_time FROM appointments a
     JOIN leads l ON a.lead_id = l.id
     WHERE l.phone = ? AND a.status = 'scheduled'
     ORDER BY a.created_at DESC LIMIT 1
   `).get(phone);
-  return row ? row.confirmation_code : null;
+  return row || null;
+}
+
+// Format a stored start_time the EXACT same way booking does (UTC).
+function labelFromStartTime(startTime) {
+  const d = new Date(startTime);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZone: 'UTC'
+  });
+}
+
+function setServiceAddress(appointmentId, address) {
+  if (!HAS_SERVICE_ADDRESS) return false;
+  try {
+    const confirmedSet = HAS_ADDRESS_CONFIRMED ? ', address_confirmed = 1' : '';
+    db.prepare(`UPDATE appointments SET service_address = ?${confirmedSet} WHERE id = ?`)
+      .run(address, appointmentId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function executeToolCall(toolName, toolInput, context) {
@@ -260,9 +304,9 @@ function executeToolCall(toolName, toolInput, context) {
         const carriedAddress = findMostRecentAddressForPhone(From);
         let addressCarriedOver = false;
         if (carriedAddress) {
-          db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
-            .run(carriedAddress, bookResult.appointmentId);
-          addressCarriedOver = true;
+          if (setServiceAddress(bookResult.appointmentId, carriedAddress)) {
+            addressCarriedOver = true;
+          }
         }
 
         const carriedName = findMostRecentNameForPhone(From);
@@ -294,9 +338,8 @@ function executeToolCall(toolName, toolInput, context) {
   } else if (toolName === 'save_customer_info') {
     const appt = getAppointmentByPhone(From);
     if (appt) {
-      db.prepare('UPDATE appointments SET service_address = ?, address_confirmed = 1 WHERE id = ?')
-        .run(toolInput.address, appt.id);
-      result = { success: true };
+      const ok = setServiceAddress(appt.id, toolInput.address);
+      result = ok ? { success: true } : { success: false, message: 'Could not save address.' };
     } else {
       result = { success: false, message: 'No active appointment found to attach address to.' };
     }
@@ -496,7 +539,19 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // 0. Validate AVAILABILITY CLAIMS match what was actually checked
+  // Establish the SINGLE SOURCE OF TRUTH for this customer's active booking.
+  // Prefer facts verified this turn; otherwise read them straight from the DB.
+  // This survives across turns (unlike verifiedFacts, which resets every message),
+  // so the code/date/time can be validated even on the final turn where the AI
+  // reveals them after collecting name and address on earlier turns.
+  const activeAppt = findActiveAppointmentForPhone(From);
+  const trueConfirmationCode =
+    verifiedFacts.confirmationCode || (activeAppt ? activeAppt.confirmation_code : null);
+  const trueAppointmentLabel =
+    verifiedFacts.appointmentLabel ||
+    (activeAppt ? labelFromStartTime(activeAppt.start_time) : null);
+
+  // 0. Validate AVAILABILITY CLAIMS match what was actually checked (pre-booking only)
   if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn && verifiedFacts.lastCheckHadRequestedAvailability) {
     const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
     if (realDayMatch) {
@@ -513,61 +568,81 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
-  // 1. NEW booking confirmation claims without verified booking this turn
+  // 1. NEW booking confirmation claims without any verified/active booking
   const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
-
-  if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
-    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed NEW booking confirmation with no verified tool result.`);
+  if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled && !activeAppt) {
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed booking confirmation with no verified or active booking.`);
     finalText = "Let me get that booked for you properly - one moment please.";
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
   }
 
-  // 2. Confirmation code accuracy check - runs whenever a code is mentioned in finalText
-  const trueConfirmationCode = verifiedFacts.confirmationCode || findActiveConfirmationCodeForPhone(From);
-
-  if (!guardrailTriggered && trueConfirmationCode) {
-    const codeMatch = /confirmation code\s*(?:is|:)?\s*#?([a-z0-9\-]+)/i.exec(finalText);
-    if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== trueConfirmationCode.toUpperCase().replace(/-/g, '')) {
-      console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[1]}", real code is "${trueConfirmationCode}"`);
-      finalText = finalText.replace(codeMatch[0], `confirmation code is ${trueConfirmationCode}`);
-      guardrailTriggered = true;
-    }
-  }
-
-  // 3. Time and day accuracy check
-  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
-    const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
-    if (timeWordsInLabel) {
-      const realTime = timeWordsInLabel[0].toUpperCase().replace(/\s/g, '');
-      const allTimesInText = finalText.match(/\d{1,2}:\d{2}\s*[AP]M/gi) || [];
-      const hasTimeMismatch = allTimesInText.some(t => t.toUpperCase().replace(/\s/g, '') !== realTime);
-      if (hasTimeMismatch) {
-        console.error(`[GUARDRAIL] lead=${lead.id} Time mismatch detected.`);
+  // 2. SURGICAL FACT REPLACEMENT — the AI writes the natural sentence,
+  // but every confirmation code, time, and day it states is overwritten
+  // with the true value from the database before sending. The AI cannot
+  // emit a wrong code/time/day because it never gets the final say on them.
+  if (!guardrailTriggered) {
+    // 2a. Confirmation code
+    if (trueConfirmationCode) {
+      const codeRe = /(confirmation code\s*(?:is|:)?\s*#?)([a-z0-9\-]+)/i;
+      const codeMatch = codeRe.exec(finalText);
+      if (codeMatch) {
+        const statedCode = codeMatch[2].toUpperCase().replace(/-/g, '');
+        const realCode = trueConfirmationCode.toUpperCase().replace(/-/g, '');
+        if (statedCode !== realCode) {
+          console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[2]}", real code is "${trueConfirmationCode}". Corrected.`);
+          finalText = finalText.replace(codeMatch[0], `${codeMatch[1]}${trueConfirmationCode}`);
+          guardrailTriggered = true;
+        }
+      }
+    } else {
+      // No verifiable code exists but the AI is stating one → fail safe.
+      const statesACode = /confirmation code\s*(?:is|:)/i.test(finalText);
+      if (statesACode) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Message states a confirmation code but none could be verified. Holding message.`);
+        finalText = "You're all set! A team member will text your confirmation details shortly.";
         updateLead(lead.id, { status: 'needs_followup' });
         guardrailTriggered = true;
       }
     }
 
-    if (!guardrailTriggered) {
-      const realDayMatch = verifiedFacts.appointmentLabel.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
+    // 2b. Time and 2c. Day — only correct once we have a real booking to compare to.
+    if (trueAppointmentLabel) {
+      const realTimeMatch = trueAppointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
+      const realDayMatch = trueAppointmentLabel.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
+
+      // Replace any wrong time tokens with the real one.
+      if (realTimeMatch) {
+        const realTime = realTimeMatch[0].replace(/\s+/g, ' ').toUpperCase();
+        const realTimeNorm = realTime.replace(/\s/g, '');
+        finalText = finalText.replace(/\d{1,2}:\d{2}\s*[AP]M/gi, (tok) => {
+          if (tok.toUpperCase().replace(/\s/g, '') !== realTimeNorm) {
+            console.error(`[GUARDRAIL] lead=${lead.id} time mismatch. Claude said "${tok}", real time is "${realTime}". Corrected.`);
+            guardrailTriggered = true;
+            return realTime;
+          }
+          return tok;
+        });
+      }
+
+      // Replace any wrong weekday tokens with the real one.
       if (realDayMatch) {
         const realDay = realDayMatch[1];
-        const dayPattern = /\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi;
-        const daysInText = finalText.match(dayPattern) || [];
-        const hasDayMismatch = daysInText.some(d => d.toLowerCase() !== realDay.toLowerCase());
-        if (hasDayMismatch) {
-          console.error(`[GUARDRAIL] lead=${lead.id} Day mismatch detected.`);
-          updateLead(lead.id, { status: 'needs_followup' });
-          guardrailTriggered = true;
-        }
+        finalText = finalText.replace(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi, (tok) => {
+          if (tok.toLowerCase() !== realDay.toLowerCase()) {
+            console.error(`[GUARDRAIL] lead=${lead.id} day mismatch. Claude said "${tok}", real day is "${realDay}". Corrected.`);
+            guardrailTriggered = true;
+            return realDay;
+          }
+          return tok;
+        });
       }
     }
   }
 
-  // 4. Cancellation claims without verified cancellation
+  // 3. Cancellation claims without verified cancellation
   const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
-  if (!guardrailTriggered && claimsCancellation && !verifiedFacts.cancelledThisTurn) {
+  if (claimsCancellation && !verifiedFacts.cancelledThisTurn) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result.`);
     finalText = verifiedFacts.cancelFailed
       ? "I couldn't find an active appointment to cancel under this number. A team member will follow up to confirm."
@@ -576,16 +651,16 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 5. Address confirmation claims without verified save or carry-over
+  // 4. Address confirmation claims without verified save or carry-over
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
-  if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
+  if (claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result.`);
     updateLead(lead.id, { status: 'needs_followup' });
     guardrailTriggered = true;
   }
 
   if (guardrailTriggered) {
-    console.error(`[GUARDRAIL_SUMMARY] lead=${lead.id} A guardrail was triggered this turn - flagged for manual review.`);
+    console.error(`[GUARDRAIL_SUMMARY] lead=${lead.id} A guardrail was triggered this turn - flagged/corrected for review.`);
   }
 
   return finalText;
