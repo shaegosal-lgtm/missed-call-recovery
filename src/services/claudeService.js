@@ -188,6 +188,16 @@ function findMostRecentNameForPhone(phone) {
   return row ? row.name : null;
 }
 
+function findActiveConfirmationCodeForPhone(phone) {
+  const row = db.prepare(`
+    SELECT a.confirmation_code FROM appointments a
+    JOIN leads l ON a.lead_id = l.id
+    WHERE l.phone = ? AND a.status = 'scheduled'
+    ORDER BY a.created_at DESC LIMIT 1
+  `).get(phone);
+  return row ? row.confirmation_code : null;
+}
+
 function executeToolCall(toolName, toolInput, context) {
   const { business, lead, From } = context;
   let result;
@@ -513,22 +523,14 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 2. Confirmation code accuracy check - only enforced once name AND address are fully resolved
-  // This prevents the guardrail from fighting against the legitimate name/address collection flow,
-  // where the code is correctly withheld until both pieces of info are gathered.
-  const stillCollectingNameOrAddress = verifiedFacts.bookedThisTurn &&
-    ((!verifiedFacts.nameCarriedOverThisTurn && !verifiedFacts.nameSavedThisTurn) ||
-     (!verifiedFacts.addressCarriedOverThisTurn && !verifiedFacts.addressSavedThisTurn));
+  // 2. Confirmation code accuracy check - runs whenever a code is mentioned in finalText
+  const trueConfirmationCode = verifiedFacts.confirmationCode || findActiveConfirmationCodeForPhone(From);
 
-  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.confirmationCode && !stillCollectingNameOrAddress) {
+  if (!guardrailTriggered && trueConfirmationCode) {
     const codeMatch = /confirmation code\s*(?:is|:)?\s*#?([a-z0-9\-]+)/i.exec(finalText);
-    if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== verifiedFacts.confirmationCode.toUpperCase().replace(/-/g, '')) {
-      console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[1]}", real code is "${verifiedFacts.confirmationCode}"`);
-      finalText = finalText.replace(codeMatch[0], `confirmation code is ${verifiedFacts.confirmationCode}`);
-      guardrailTriggered = true;
-    } else if (!codeMatch) {
-      console.error(`[GUARDRAIL] lead=${lead.id} Booking succeeded, name/address resolved, but no confirmation code was mentioned. Appending it.`);
-      finalText = `${finalText} Your confirmation code is ${verifiedFacts.confirmationCode}.`;
+    if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== trueConfirmationCode.toUpperCase().replace(/-/g, '')) {
+      console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[1]}", real code is "${trueConfirmationCode}"`);
+      finalText = finalText.replace(codeMatch[0], `confirmation code is ${trueConfirmationCode}`);
       guardrailTriggered = true;
     }
   }
