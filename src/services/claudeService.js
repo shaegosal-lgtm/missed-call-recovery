@@ -359,6 +359,7 @@ When book_appointment succeeds, check the result for name_carried_over and addre
 - If only ONE is true: acknowledge the one on file, then ask for the missing one. Do NOT mention the confirmation code yet - wait until you have the missing piece.
 - If NEITHER is true: ask for the customer's name first ("Great, you're booked in! Can I get your name?") with NO confirmation code in this message. Once they provide it, call save_customer_name, then ask for the service address with NO confirmation code yet. Once they provide that, call save_customer_info, then give the confirmation code in that final message.
 - Ask for name and address as two separate, sequential questions - never both in the same message, and never alongside the confirmation code until both are resolved.
+
 CLOSING A CONVERSATION:
 If the customer clearly declines service (says "not interested", "no thanks", "I'll go elsewhere", or similar, and is NOT booking an appointment), call mark_conversation_closed after responding warmly.
 
@@ -485,6 +486,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
+  // 0. Validate AVAILABILITY CLAIMS match what was actually checked
   if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn && verifiedFacts.lastCheckHadRequestedAvailability) {
     const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
     if (realDayMatch) {
@@ -501,6 +503,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
+  // 1. NEW booking confirmation claims without verified booking this turn
   const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
 
   if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled) {
@@ -510,19 +513,27 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.confirmationCode) {
+  // 2. Confirmation code accuracy check - only enforced once name AND address are fully resolved
+  // This prevents the guardrail from fighting against the legitimate name/address collection flow,
+  // where the code is correctly withheld until both pieces of info are gathered.
+  const stillCollectingNameOrAddress = verifiedFacts.bookedThisTurn &&
+    ((!verifiedFacts.nameCarriedOverThisTurn && !verifiedFacts.nameSavedThisTurn) ||
+     (!verifiedFacts.addressCarriedOverThisTurn && !verifiedFacts.addressSavedThisTurn));
+
+  if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.confirmationCode && !stillCollectingNameOrAddress) {
     const codeMatch = /confirmation code\s*(?:is|:)?\s*#?([a-z0-9\-]+)/i.exec(finalText);
     if (codeMatch && codeMatch[1].toUpperCase().replace(/-/g, '') !== verifiedFacts.confirmationCode.toUpperCase().replace(/-/g, '')) {
-      console.error(`[GUARDRAIL] lead=${lead.id} code mismatch.`);
+      console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[1]}", real code is "${verifiedFacts.confirmationCode}"`);
       finalText = finalText.replace(codeMatch[0], `confirmation code is ${verifiedFacts.confirmationCode}`);
       guardrailTriggered = true;
     } else if (!codeMatch) {
-      console.error(`[GUARDRAIL] lead=${lead.id} Booking succeeded but no confirmation code was mentioned. Appending it.`);
+      console.error(`[GUARDRAIL] lead=${lead.id} Booking succeeded, name/address resolved, but no confirmation code was mentioned. Appending it.`);
       finalText = `${finalText} Your confirmation code is ${verifiedFacts.confirmationCode}.`;
       guardrailTriggered = true;
     }
   }
 
+  // 3. Time and day accuracy check
   if (!guardrailTriggered && verifiedFacts.bookedThisTurn && verifiedFacts.appointmentLabel) {
     const timeWordsInLabel = verifiedFacts.appointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
     if (timeWordsInLabel) {
@@ -552,6 +563,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     }
   }
 
+  // 4. Cancellation claims without verified cancellation
   const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
   if (!guardrailTriggered && claimsCancellation && !verifiedFacts.cancelledThisTurn) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result.`);
@@ -562,6 +574,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
+  // 5. Address confirmation claims without verified save or carry-over
   const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
   if (!guardrailTriggered && claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
     console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result.`);
