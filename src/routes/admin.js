@@ -180,5 +180,39 @@ router.get('/businesses/:id/appointments', adminAuth, (req, res) => {
   `).all(req.params.id);
   res.json(appointments);
 });
+// Clear all leads, calls, and appointments for a business (testing utility)
+router.delete('/businesses/:id/test-data', adminAuth, (req, res) => {
+  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
+  if (!business) return res.status(404).json({ error: 'Not found' });
 
+  const leads = db.prepare(`
+    SELECT id FROM leads WHERE call_id IN (
+      SELECT id FROM calls WHERE to_number = ?
+    )
+  `).all(business.twilio_number);
+
+  const leadIds = leads.map(l => l.id);
+
+  let appointmentsDeleted = 0;
+  if (leadIds.length > 0) {
+    const placeholders = leadIds.map(() => '?').join(',');
+    const apptResult = db.prepare(`DELETE FROM appointments WHERE lead_id IN (${placeholders})`).run(...leadIds);
+    appointmentsDeleted = apptResult.changes;
+  }
+
+  const leadsResult = db.prepare(`
+    DELETE FROM leads WHERE call_id IN (
+      SELECT id FROM calls WHERE to_number = ?
+    )
+  `).run(business.twilio_number);
+
+  const callsResult = db.prepare('DELETE FROM calls WHERE to_number = ?').run(business.twilio_number);
+
+  res.json({
+    success: true,
+    appointmentsDeleted,
+    leadsDeleted: leadsResult.changes,
+    callsDeleted: callsResult.changes
+  });
+});
 module.exports = router;
