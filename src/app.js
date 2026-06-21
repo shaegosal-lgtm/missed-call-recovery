@@ -5,6 +5,7 @@ const session = require('express-session');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db/db');
 const { startReminderJob } = require('./services/reminderService');
+const { startFollowUpJob } = require('./services/followUpService');
 
 const twilioRoutes = require('./routes/twilio');
 const leadRoutes = require('./routes/leads');
@@ -90,6 +91,7 @@ function setupBusiness() {
 runMigrations();
 setupBusiness();
 startReminderJob();
+startFollowUpJob();
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
