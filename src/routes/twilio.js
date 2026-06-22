@@ -34,6 +34,8 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
   }
 }
 
+// Updates the lead's urgency/type/summary for the dashboard. Does NOT send email.
+// Safe to call repeatedly as the conversation develops.
 async function runClassificationSafely(From, lead, business) {
   try {
     const freshLead = getLeadByPhone(From) || lead;
@@ -45,11 +47,27 @@ async function runClassificationSafely(From, lead, business) {
       lead_type: result.lead_type,
       ai_summary: result.summary,
     });
-
-    await safeNotifyOwner({ ...freshLead, ...result });
-    await safeSendLeadNotification(business || { name: 'the business' }, { ...freshLead, ...result });
+    return result;
   } catch (err) {
     console.error('[runClassificationSafely] Failed:', err.message || err);
+    return null;
+  }
+}
+
+// Sends the new-lead email EXACTLY ONCE per lead, guarded by the notified flag.
+async function sendNewLeadEmailOnce(From, lead, business) {
+  try {
+    const fresh = db.prepare('SELECT * FROM leads WHERE id = ?').get(lead.id);
+    if (!fresh || fresh.notified) return; // already emailed — never send again
+
+    // Mark first to avoid any double-send if two messages arrive close together.
+    updateLead(lead.id, { notified: 1 });
+
+    await safeNotifyOwner(fresh);
+    await safeSendLeadNotification(business || { name: 'the business' }, fresh);
+    console.log(`New-lead email sent for ${From} (lead ${lead.id})`);
+  } catch (err) {
+    console.error('[sendNewLeadEmailOnce] Failed:', err.message || err);
   }
 }
 
@@ -151,9 +169,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
 
   // No active lead (new customer, or their previous lead was closed/deleted).
   // Start a fresh lead so the AI engages and can rebook — instead of dead-ending.
-  // A new lead has no name/address, so the AI naturally re-asks; if the customer
-  // still has older records in the DB (closed or trashed, not permanently deleted),
-  // booking will carry that info forward automatically.
   if (!lead) {
     try {
       const callId = uuidv4();
@@ -161,7 +176,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
         .run(callId, From, process.env.TWILIO_PHONE_NUMBER || 'unknown', `text-${callId}`, 'text-in');
       const newLeadId = createLead(From, callId);
       lead = getLeadByPhone(From);
-      // Safety: if for some reason it still can't be read back, bail gracefully.
       if (!lead) {
         await sendSMS(From, `Thanks for reaching out! A team member will get back to you shortly.`);
         return res.status(200).send('<Response></Response>');
@@ -187,7 +201,11 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (!business) {
     await sendAndLog(lead.id, From, `Thanks for reaching out! A team member will get back to you shortly.`);
     updateLead(lead.id, { status: 'needs_followup' });
-    await runClassificationSafely(From, lead, business);
+    // Classify + send the single new-lead email (still once, even with no business).
+    if (isFirstSubstantiveReply) {
+      await runClassificationSafely(From, lead, business);
+      await sendNewLeadEmailOnce(From, lead, business);
+    }
     return res.status(200).send('<Response></Response>');
   }
 
@@ -196,6 +214,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     reply = await runReceptionistConversation(business, lead, convo, text, From);
     await sendAndLog(lead.id, From, reply);
 
+    // Keep the dashboard classification fresh as the conversation develops.
     const leadAfterReply = getLeadByPhone(From);
     const statusChanged = leadAfterReply && leadAfterReply.status !== lead.status;
     const isMeaningfulMoment =
@@ -208,13 +227,9 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await runClassificationSafely(From, lead, business);
     }
 
-    if (reply.toLowerCase().includes('confirmation code')) {
-      const codeMatch = reply.match(/confirmation code:?\s*(?:is)?\s*([a-z0-9]+)/i);
-      const code = codeMatch ? codeMatch[1] : null;
-      if (code) {
-        await safeNotifyOwner({ ...lead, ai_summary: `Appointment booked. Code: ${code}` });
-        await safeSendLeadNotification(business, { ...lead, ai_summary: `Appointment booked. Code: ${code}` }, code);
-      }
+    // Send the new-lead alert email EXACTLY ONCE, on their first substantive message.
+    if (isFirstSubstantiveReply) {
+      await sendNewLeadEmailOnce(From, lead, business);
     }
   } catch (err) {
     console.error('[sms-reply] Receptionist conversation failed:', err.message || err);

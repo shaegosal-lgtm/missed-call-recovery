@@ -31,6 +31,7 @@ db.exec(`
     status TEXT DEFAULT 'new',
     conversation TEXT DEFAULT '[]',
     viewed INTEGER DEFAULT 0,
+    notified INTEGER DEFAULT 0,
     deleted_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
@@ -91,8 +92,6 @@ db.exec(`
 `);
 
 // --- Safe migrations: add columns to existing databases without data loss ---
-// CREATE TABLE IF NOT EXISTS won't alter a table that already exists, so we add
-// newer columns here. Each is wrapped so a re-run (column already present) is a no-op.
 function ensureColumn(table, column, definition) {
   try {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
@@ -106,6 +105,7 @@ function ensureColumn(table, column, definition) {
 }
 
 ensureColumn('leads', 'viewed', 'INTEGER DEFAULT 0');
+ensureColumn('leads', 'notified', 'INTEGER DEFAULT 0');
 ensureColumn('leads', 'deleted_at', 'DATETIME');
 
 module.exports = db;
