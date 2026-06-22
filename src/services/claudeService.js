@@ -180,8 +180,6 @@ const appointmentColumns = (() => {
 const HAS_SERVICE_ADDRESS = appointmentColumns.has('service_address');
 const HAS_ADDRESS_CONFIRMED = appointmentColumns.has('address_confirmed');
 
-// All phone lookups are scoped to businessId so the same phone number used
-// across two different businesses can never leak data between them.
 function findMostRecentAddressForPhone(phone, businessId) {
   if (!HAS_SERVICE_ADDRESS) return null;
   try {
@@ -209,7 +207,8 @@ function findMostRecentNameForPhone(phone, businessId) {
   return row ? row.name : null;
 }
 
-// Single source of truth for an active booking, scoped to this business.
+// Only used for the confirmation-CODE check (codes are unique per appointment,
+// so cross-turn lookup is safe). NOT used for time/day correction anymore.
 function findActiveAppointmentForPhone(phone, businessId) {
   const row = db.prepare(`
     SELECT a.confirmation_code, a.start_time FROM appointments a
@@ -400,7 +399,7 @@ HANDLING UNAVAILABLE DAYS:
 If a customer asks about a specific day and check_availability shows requested_date_had_availability: false, it means that day has no openings. Be honest and natural about this: explain that day isn't available and offer the next_available_date_formatted instead.
 
 SLOT BOOKING RULE:
-When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result.
+When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result. When you present options to the customer, present the actual times the tool returned, and when the customer picks a time, book the slot_id that matches THAT time - never substitute a different time than the one the customer chose.
 
 NAME AND ADDRESS HANDLING - ONLY COLLECTED AT BOOKING TIME:
 Do NOT ask for the customer's name or address at any point before they have confirmed a specific appointment slot. Only after book_appointment succeeds do you collect this information.
@@ -424,7 +423,7 @@ CORE BEHAVIOR RULES:
 5. When a customer wants to book: find the correct date using the DATE LOOKUP TABLE, then call check_availability.
 6. Present at most 3 options using the EXACT wording/times the tool returned.
 7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters.
-8. Once confirmed, call book_appointment with the matching slot_id.
+8. Once confirmed, call book_appointment with the matching slot_id - the one whose label matches the exact time the customer chose.
 9. After book_appointment succeeds, follow the NAME AND ADDRESS HANDLING rules above before giving the confirmation code.
 10. When the customer gives a NEW address, call save_customer_info. When they give a NEW name, call save_customer_name. Then state the confirmation code exactly as returned, and the appointment time exactly as returned in appointment_label.
 11. If the customer prefers a callback instead of giving name/address, call flag_needs_followup, then state the confirmation code exactly as returned.
@@ -436,6 +435,7 @@ CORE BEHAVIOR RULES:
 17. Acknowledge urgency briefly, then prioritize booking quickly.
 18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally.
 19. If a customer's message contains multiple pieces of information at once, parse each piece separately, especially the requested day, using the DATE LOOKUP TABLE.
+20. When a customer asks for a specific time, offer that exact time if the tool shows it available. Do not offer a different time than they asked for unless their requested time is unavailable, and if so, say clearly that their time isn't available before offering alternatives.
 
 Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
 
@@ -539,13 +539,17 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // Single source of truth for this customer's active booking, scoped to THIS business.
+  // Confirmation CODE may be revealed across turns, so look it up cross-turn (safe: codes are unique).
   const activeAppt = findActiveAppointmentForPhone(From, business.id);
   const trueConfirmationCode =
     verifiedFacts.confirmationCode || (activeAppt ? activeAppt.confirmation_code : null);
-  const trueAppointmentLabel =
-    verifiedFacts.appointmentLabel ||
-    (activeAppt ? labelFromStartTime(activeAppt.start_time) : null);
+
+  // TIME/DAY are ONLY corrected against an appointment booked THIS TURN.
+  // A pre-existing appointment must never overwrite times in a new booking
+  // conversation (that bug rewrote a correct "Tuesday 9AM" to an old "Wednesday 11AM").
+  const trueAppointmentLabel = verifiedFacts.bookedThisTurn
+    ? verifiedFacts.appointmentLabel
+    : null;
 
   // 0. Validate AVAILABILITY CLAIMS match what was actually checked (pre-booking only)
   if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn && verifiedFacts.lastCheckHadRequestedAvailability) {
@@ -575,7 +579,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
 
   // 2. SURGICAL FACT REPLACEMENT
   if (!guardrailTriggered) {
-    // 2a. Confirmation code
+    // 2a. Confirmation code (cross-turn lookup is safe)
     if (trueConfirmationCode) {
       const codeRe = /(confirmation code\s*(?:is|:)?\s*#?)([a-z0-9\-]+)/i;
       const codeMatch = codeRe.exec(finalText);
@@ -598,7 +602,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
       }
     }
 
-    // 2b. Time and 2c. Day
+    // 2b. Time and 2c. Day — ONLY when an appointment was booked THIS TURN.
     if (trueAppointmentLabel) {
       const realTimeMatch = trueAppointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
       const realDayMatch = trueAppointmentLabel.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
