@@ -145,17 +145,35 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   const { From, Body } = req.body;
   const text = Body.trim();
 
-  const lead = getLeadByPhone(From);
+  const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(process.env.TWILIO_PHONE_NUMBER);
+
+  let lead = getLeadByPhone(From);
+
+  // No active lead (new customer, or their previous lead was closed/deleted).
+  // Start a fresh lead so the AI engages and can rebook — instead of dead-ending.
+  // A new lead has no name/address, so the AI naturally re-asks; if the customer
+  // still has older records in the DB (closed or trashed, not permanently deleted),
+  // booking will carry that info forward automatically.
   if (!lead) {
     try {
-      await sendSMS(From, `Thanks for reaching out! Please call us and we will be happy to help.`);
+      const callId = uuidv4();
+      db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
+        .run(callId, From, process.env.TWILIO_PHONE_NUMBER || 'unknown', `text-${callId}`, 'text-in');
+      const newLeadId = createLead(From, callId);
+      lead = getLeadByPhone(From);
+      // Safety: if for some reason it still can't be read back, bail gracefully.
+      if (!lead) {
+        await sendSMS(From, `Thanks for reaching out! A team member will get back to you shortly.`);
+        return res.status(200).send('<Response></Response>');
+      }
+      console.log(`New text-initiated lead created for ${From}: ${newLeadId}`);
     } catch (err) {
-      console.error('[sms-reply] Failed to send no-lead SMS:', err.message || err);
+      console.error('[sms-reply] Failed to create text-initiated lead:', err.message || err);
+      await sendSMS(From, `Thanks for reaching out! A team member will get back to you shortly.`);
+      return res.status(200).send('<Response></Response>');
     }
-    return res.status(200).send('<Response></Response>');
   }
 
-  const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(process.env.TWILIO_PHONE_NUMBER);
   const convo = JSON.parse(lead.conversation || '[]');
 
   appendToConversation(lead.id, 'customer', text);
