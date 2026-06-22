@@ -30,6 +30,8 @@ db.exec(`
     ai_summary TEXT,
     status TEXT DEFAULT 'new',
     conversation TEXT DEFAULT '[]',
+    viewed INTEGER DEFAULT 0,
+    deleted_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -87,5 +89,23 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+// --- Safe migrations: add columns to existing databases without data loss ---
+// CREATE TABLE IF NOT EXISTS won't alter a table that already exists, so we add
+// newer columns here. Each is wrapped so a re-run (column already present) is a no-op.
+function ensureColumn(table, column, definition) {
+  try {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+    if (!cols.includes(column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      console.log(`Migration: added ${table}.${column}`);
+    }
+  } catch (err) {
+    console.error(`Migration failed for ${table}.${column}:`, err.message);
+  }
+}
+
+ensureColumn('leads', 'viewed', 'INTEGER DEFAULT 0');
+ensureColumn('leads', 'deleted_at', 'DATETIME');
 
 module.exports = db;

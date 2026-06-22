@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const db = require('../db/db');
+const {
+  deleteLead,
+  recoverLead,
+  permanentlyDeleteLead,
+} = require('../services/leadService');
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
@@ -96,13 +101,63 @@ router.post('/api/leads/:id/view', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+// Confirms a lead belongs to the logged-in user (admins can touch any lead).
+function userCanAccessLead(req, leadId) {
+  if (req.session.role === 'admin') return true;
+  const row = db.prepare(`
+    SELECT l.id FROM leads l
+    JOIN calls c ON l.call_id = c.id
+    JOIN businesses b ON c.to_number = b.twilio_number
+    WHERE l.id = ? AND b.id = ?
+  `).get(leadId, req.session.businessId);
+  return !!row;
+}
+
+// Move selected leads to the trash. Skips any blocked by an active appointment.
+router.post('/api/leads/delete', requireAuth, (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+  let deleted = 0;
+  const blocked = [];
+  for (const id of ids) {
+    if (!userCanAccessLead(req, id)) continue;
+    const result = deleteLead(id);
+    if (result.success) deleted++;
+    else if (result.reason === 'has_active_appointment') blocked.push(id);
+  }
+  res.json({ success: true, deleted, blocked });
+});
+
+// Recover selected leads from the trash.
+router.post('/api/leads/recover', requireAuth, (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+  let recovered = 0;
+  for (const id of ids) {
+    if (!userCanAccessLead(req, id)) continue;
+    const result = recoverLead(id);
+    if (result.success) recovered++;
+  }
+  res.json({ success: true, recovered });
+});
+
+// Permanently erase selected trashed leads (and their appointments).
+router.post('/api/leads/permanent-delete', requireAuth, (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+  let erased = 0;
+  for (const id of ids) {
+    if (!userCanAccessLead(req, id)) continue;
+    const result = permanentlyDeleteLead(id);
+    if (result.success) erased++;
+  }
+  res.json({ success: true, erased });
+});
+
 router.get('/', requireAuth, (req, res) => {
   if (req.session.role === 'admin') {
     const businesses = db.prepare('SELECT * FROM businesses ORDER BY created_at DESC').all();
 
     const businessCards = businesses.map(b => {
       const leadCount = db.prepare(`
-        SELECT COUNT(*) as count FROM leads WHERE call_id IN (
+        SELECT COUNT(*) as count FROM leads WHERE deleted_at IS NULL AND call_id IN (
           SELECT id FROM calls WHERE to_number = ?
         )
       `).get(b.twilio_number).count;
@@ -145,10 +200,18 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
   if (!business) return res.redirect('/dashboard');
 
+  // LIVE leads (not trashed)
   const leads = db.prepare(`
-    SELECT * FROM leads WHERE call_id IN (
+    SELECT * FROM leads WHERE deleted_at IS NULL AND call_id IN (
       SELECT id FROM calls WHERE to_number = ?
     ) ORDER BY created_at DESC
+  `).all(business.twilio_number);
+
+  // TRASHED leads
+  const deletedLeads = db.prepare(`
+    SELECT * FROM leads WHERE deleted_at IS NOT NULL AND call_id IN (
+      SELECT id FROM calls WHERE to_number = ?
+    ) ORDER BY deleted_at DESC
   `).all(business.twilio_number);
 
   const appointments = db.prepare(`
@@ -198,20 +261,44 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const leadCards = leads.map(l => {
     const isNew = !l.viewed;
     return `
-    <div class="lead-row ${isNew ? 'is-new' : ''}" onclick="showLead('${l.id}')" data-lead-id="${l.id}">
+    <div class="lead-row ${isNew ? 'is-new' : ''}" data-lead-id="${l.id}">
+      <input type="checkbox" class="row-check leads-check" value="${l.id}" onclick="event.stopPropagation()">
       ${isNew ? '<div class="new-dot"></div>' : ''}
-      <div class="lead-avatar">${initials(l.name, l.phone)}</div>
-      <div class="lead-main">
-        <div class="lead-name-line">
-          <span class="lead-name">${l.name || 'Unknown Caller'}</span>
-          <span class="lead-date">${new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+      <div class="lead-body" onclick="showLead('${l.id}')">
+        <div class="lead-avatar">${initials(l.name, l.phone)}</div>
+        <div class="lead-main">
+          <div class="lead-name-line">
+            <span class="lead-name">${l.name || 'Unknown Caller'}</span>
+            <span class="lead-date">${new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+          </div>
+          <div class="lead-phone">${l.phone}</div>
+          <div class="lead-summary">${l.ai_summary || l.reason || 'No summary yet'}</div>
         </div>
-        <div class="lead-phone">${l.phone}</div>
-        <div class="lead-summary">${l.ai_summary || l.reason || 'No summary yet'}</div>
+        <div class="lead-tags">
+          <span class="tag-lg urgency-${l.urgency}">${l.urgency}</span>
+          <span class="tag-lg status-${l.status}">${l.status}</span>
+        </div>
       </div>
-      <div class="lead-tags">
-        <span class="tag-lg urgency-${l.urgency}">${l.urgency}</span>
-        <span class="tag-lg status-${l.status}">${l.status}</span>
+    </div>
+  `}).join('');
+
+  const deletedCards = deletedLeads.map(l => {
+    const deletedDate = new Date(l.deleted_at);
+    const purgeDate = new Date(deletedDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const daysLeft = Math.max(0, Math.ceil((purgeDate - now) / (1000 * 60 * 60 * 24)));
+    return `
+    <div class="lead-row" data-lead-id="${l.id}">
+      <input type="checkbox" class="row-check deleted-check" value="${l.id}" onclick="event.stopPropagation()">
+      <div class="lead-body" onclick="showLead('${l.id}')">
+        <div class="lead-avatar" style="background:var(--gray-500)">${initials(l.name, l.phone)}</div>
+        <div class="lead-main">
+          <div class="lead-name-line">
+            <span class="lead-name">${l.name || 'Unknown Caller'}</span>
+            <span class="lead-date">Deleted ${deletedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+          </div>
+          <div class="lead-phone">${l.phone}</div>
+          <div class="lead-summary">Auto-erases in ${daysLeft} day${daysLeft === 1 ? '' : 's'}</div>
+        </div>
       </div>
     </div>
   `}).join('');
@@ -284,7 +371,8 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const pastCards = pastAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
   const cancelledCards = cancelledAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
 
-  const leadData = JSON.stringify(leads).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+  const allLeadsForJs = [...leads, ...deletedLeads];
+  const leadData = JSON.stringify(allLeadsForJs).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
 
   const trendBars = last7Days.map(d => `
@@ -306,6 +394,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
       <button class="tab-btn" onclick="switchTab('leads', this)">Leads <span class="tab-count">${leads.length}</span></button>
       <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${upcomingAppts.length}</span></button>
+      <button class="tab-btn" onclick="switchTab('deleted', this)">Deleted <span class="tab-count">${deletedLeads.length}</span></button>
     </div>
 
     <div id="tab-overview" class="tab-content active">
@@ -390,8 +479,20 @@ router.get('/business/:id', requireAuth, (req, res) => {
         <span class="legend-item"><span class="legend-dot" style="background:#F59E0B"></span>Medium</span>
         <span class="legend-item"><span class="legend-dot" style="background:#16A34A"></span>Low</span>
       </div>
-      <div class="section">
-        ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : `<div class="lead-list">${leadCards}</div>`}
+
+      <div class="select-bar">
+        <button class="select-toggle" id="leads-select-toggle" onclick="toggleSelectMode('leads')">Select</button>
+        <div class="select-actions" id="leads-select-actions">
+          <span class="select-count" id="leads-select-count">0 selected</span>
+          <button class="btn-danger" onclick="deleteSelected()">Delete selected</button>
+          <button class="btn-plain" onclick="toggleSelectMode('leads')">Cancel</button>
+        </div>
+      </div>
+
+      <div class="section ${'' /* select-mode class toggled on the list below */}">
+        <div class="lead-list" id="leads-list">
+          ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : leadCards}
+        </div>
       </div>
     </div>
 
@@ -438,6 +539,26 @@ router.get('/business/:id', requireAuth, (req, res) => {
       </div>
     </div>
 
+    <div id="tab-deleted" class="tab-content">
+      <div class="deleted-note">Deleted leads are kept for 30 days, then permanently erased. You can recover them anytime before then.</div>
+
+      <div class="select-bar">
+        <button class="select-toggle" id="deleted-select-toggle" onclick="toggleSelectMode('deleted')">Select</button>
+        <div class="select-actions" id="deleted-select-actions">
+          <span class="select-count" id="deleted-select-count">0 selected</span>
+          <button class="btn-recover" onclick="recoverSelected()">Recover selected</button>
+          <button class="btn-danger" onclick="permanentDeleteSelected()">Delete permanently</button>
+          <button class="btn-plain" onclick="toggleSelectMode('deleted')">Cancel</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="lead-list" id="deleted-list">
+          ${deletedLeads.length === 0 ? '<div class="empty">Nothing in the trash</div>' : deletedCards}
+        </div>
+      </div>
+    </div>
+
     <div class="modal" id="modal">
       <div class="modal-box">
         <span class="modal-close" onclick="closeModal()">×</span>
@@ -448,6 +569,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
 
     <script>
       const leads = JSON.parse(\`${leadData}\`);
+      const selectMode = { leads: false, deleted: false };
 
       function switchTab(tabName, btn) {
         document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -461,6 +583,71 @@ router.get('/business/:id', requireAuth, (req, res) => {
         document.querySelectorAll('.appt-subtab-btn').forEach(el => el.classList.remove('active'));
         document.getElementById('appt-sub-' + name).classList.add('active');
         btn.classList.add('active');
+      }
+
+      function toggleSelectMode(which) {
+        selectMode[which] = !selectMode[which];
+        const on = selectMode[which];
+        const listId = which === 'leads' ? 'leads-list' : 'deleted-list';
+        const list = document.getElementById(listId);
+        list.classList.toggle('select-mode', on);
+        document.getElementById(which + '-select-toggle').style.display = on ? 'none' : 'inline-block';
+        document.getElementById(which + '-select-actions').style.display = on ? 'flex' : 'none';
+        if (!on) {
+          list.querySelectorAll('.row-check').forEach(c => { c.checked = false; });
+        }
+        updateCount(which);
+      }
+
+      function updateCount(which) {
+        const cls = which === 'leads' ? 'leads-check' : 'deleted-check';
+        const n = document.querySelectorAll('.' + cls + ':checked').length;
+        document.getElementById(which + '-select-count').textContent = n + ' selected';
+      }
+
+      function getChecked(cls) {
+        return Array.from(document.querySelectorAll('.' + cls + ':checked')).map(c => c.value);
+      }
+
+      document.addEventListener('change', function(e) {
+        if (e.target.classList.contains('leads-check')) updateCount('leads');
+        if (e.target.classList.contains('deleted-check')) updateCount('deleted');
+      });
+
+      async function deleteSelected() {
+        const ids = getChecked('leads-check');
+        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
+        const r = await fetch('/dashboard/api/leads/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        const data = await r.json();
+        if (data.blocked && data.blocked.length > 0) {
+          alert(data.deleted + ' moved to trash. ' + data.blocked.length + ' could not be deleted because they have an upcoming appointment. Cancel the appointment first.');
+        }
+        location.reload();
+      }
+
+      async function recoverSelected() {
+        const ids = getChecked('deleted-check');
+        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
+        await fetch('/dashboard/api/leads/recover', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        location.reload();
+      }
+
+      async function permanentDeleteSelected() {
+        const ids = getChecked('deleted-check');
+        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
+        const ok = confirm('Permanently erase ' + ids.length + ' lead' + (ids.length === 1 ? '' : 's') + '? This cannot be undone.');
+        if (!ok) return;
+        await fetch('/dashboard/api/leads/permanent-delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        location.reload();
       }
 
       async function showLead(id) {
@@ -597,8 +784,26 @@ function renderPage(title, content, role) {
       .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
       .legend-divider { width: 1px; height: 16px; background: var(--gray-100); margin: 0 4px; }
 
+      /* SELECT MODE */
+      .select-bar { display: flex; align-items: center; margin-bottom: 16px; min-height: 40px; }
+      .select-toggle { background: white; border: 1px solid var(--gray-300); color: var(--gray-700); padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+      .select-toggle:hover { border-color: var(--blue); color: var(--blue); }
+      .select-actions { display: none; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .select-count { font-size: 13px; color: var(--gray-500); font-weight: 600; }
+      .btn-danger { background: #DC2626; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+      .btn-danger:hover { background: #B91C1C; }
+      .btn-recover { background: #16A34A; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+      .btn-recover:hover { background: #15803D; }
+      .btn-plain { background: none; border: none; color: var(--gray-500); padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+      .btn-plain:hover { color: var(--navy); }
+      .row-check { display: none; width: 18px; height: 18px; margin: 16px 0 0 4px; flex-shrink: 0; cursor: pointer; }
+      .lead-list.select-mode .row-check { display: block; }
+      .lead-body { display: flex; align-items: flex-start; gap: 14px; flex: 1; min-width: 0; cursor: pointer; }
+
+      .deleted-note { background: var(--blue-light); border: 1px solid #CFE2FB; color: var(--gray-700); border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 16px; }
+
       .lead-list { display: flex; flex-direction: column; }
-      .lead-row { display: flex; align-items: flex-start; gap: 14px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); cursor: pointer; transition: background 0.15s; position: relative; }
+      .lead-row { display: flex; align-items: flex-start; gap: 8px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); transition: background 0.15s; position: relative; }
       .lead-row:last-child { border-bottom: none; }
       .lead-row:hover { background: var(--gray-50); }
       .lead-row.is-new { background: var(--blue-light); }

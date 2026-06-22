@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('./db/db');
 const { startReminderJob } = require('./services/reminderService');
 const { startFollowUpJob } = require('./services/followUpService');
+const { purgeOldDeletedLeads } = require('./services/leadService');
 
 const twilioRoutes = require('./routes/twilio');
 const leadRoutes = require('./routes/leads');
@@ -43,6 +44,7 @@ function runMigrations() {
     `ALTER TABLE businesses ADD COLUMN owner_email TEXT`,
     `ALTER TABLE businesses ADD COLUMN avg_job_value REAL DEFAULT 150`,
     `ALTER TABLE leads ADD COLUMN viewed INTEGER DEFAULT 0`,
+    `ALTER TABLE leads ADD COLUMN deleted_at DATETIME`,
     `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       business_id TEXT REFERENCES businesses(id),
@@ -88,10 +90,26 @@ function setupBusiness() {
   console.log('Business auto-created:', id);
 }
 
+// Permanently erases leads that have sat in the trash for more than 30 days.
+// Runs once at startup, then every 24 hours.
+function startTrashPurgeJob() {
+  const runPurge = () => {
+    try {
+      purgeOldDeletedLeads();
+    } catch (err) {
+      console.error('[trash-purge] Failed:', err.message || err);
+    }
+  };
+  runPurge(); // run once on boot
+  setInterval(runPurge, 24 * 60 * 60 * 1000); // every 24 hours
+  console.log('Trash purge job started');
+}
+
 runMigrations();
 setupBusiness();
 startReminderJob();
 startFollowUpJob();
+startTrashPurgeJob();
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
