@@ -42,10 +42,13 @@ db.exec(`
     phone TEXT,
     business_phone TEXT,
     owner_phone TEXT NOT NULL,
+    owner_email TEXT,
+    plan TEXT DEFAULT 'basic',
     timezone TEXT DEFAULT 'America/Toronto',
     appointment_duration_mins INTEGER DEFAULT 60,
     twilio_number TEXT UNIQUE NOT NULL,
     business_info TEXT,
+    avg_job_value REAL DEFAULT 150,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -107,5 +110,8 @@ function ensureColumn(table, column, definition) {
 ensureColumn('leads', 'viewed', 'INTEGER DEFAULT 0');
 ensureColumn('leads', 'notified', 'INTEGER DEFAULT 0');
 ensureColumn('leads', 'deleted_at', 'DATETIME');
+ensureColumn('businesses', 'owner_email', 'TEXT');
+ensureColumn('businesses', 'avg_job_value', 'REAL DEFAULT 150');
+ensureColumn('businesses', 'plan', "TEXT DEFAULT 'basic'");
 
 module.exports = db;
