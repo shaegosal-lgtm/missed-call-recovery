@@ -170,8 +170,6 @@ function logToolCall(leadId, toolName, input, result) {
 }
 
 // ---- Schema-safe helpers -------------------------------------------------
-// The appointments table may or may not have service_address / address_confirmed
-// columns depending on migrations. Detect once so queries never throw.
 const appointmentColumns = (() => {
   try {
     return new Set(db.prepare(`PRAGMA table_info(appointments)`).all().map(c => c.name));
@@ -182,44 +180,46 @@ const appointmentColumns = (() => {
 const HAS_SERVICE_ADDRESS = appointmentColumns.has('service_address');
 const HAS_ADDRESS_CONFIRMED = appointmentColumns.has('address_confirmed');
 
-function findMostRecentAddressForPhone(phone) {
+// All phone lookups are scoped to businessId so the same phone number used
+// across two different businesses can never leak data between them.
+function findMostRecentAddressForPhone(phone, businessId) {
   if (!HAS_SERVICE_ADDRESS) return null;
   try {
     const confirmedClause = HAS_ADDRESS_CONFIRMED ? 'AND a.address_confirmed = 1' : '';
     const row = db.prepare(`
       SELECT a.service_address FROM appointments a
       JOIN leads l ON a.lead_id = l.id
-      WHERE l.phone = ? AND a.service_address IS NOT NULL ${confirmedClause}
+      WHERE l.phone = ? AND a.business_id = ? AND a.service_address IS NOT NULL ${confirmedClause}
       ORDER BY a.created_at DESC LIMIT 1
-    `).get(phone);
+    `).get(phone, businessId);
     return row ? row.service_address : null;
   } catch {
     return null;
   }
 }
 
-function findMostRecentNameForPhone(phone) {
+function findMostRecentNameForPhone(phone, businessId) {
   const row = db.prepare(`
-    SELECT name FROM leads
-    WHERE phone = ? AND name IS NOT NULL
-    ORDER BY created_at DESC LIMIT 1
-  `).get(phone);
+    SELECT l.name FROM leads l
+    JOIN calls c ON l.call_id = c.id
+    JOIN businesses b ON c.to_number = b.twilio_number
+    WHERE l.phone = ? AND b.id = ? AND l.name IS NOT NULL
+    ORDER BY l.created_at DESC LIMIT 1
+  `).get(phone, businessId);
   return row ? row.name : null;
 }
 
-// The single source of truth for an active booking: pulls the real
-// confirmation code AND real start_time straight from the database.
-function findActiveAppointmentForPhone(phone) {
+// Single source of truth for an active booking, scoped to this business.
+function findActiveAppointmentForPhone(phone, businessId) {
   const row = db.prepare(`
     SELECT a.confirmation_code, a.start_time FROM appointments a
     JOIN leads l ON a.lead_id = l.id
-    WHERE l.phone = ? AND a.status = 'scheduled'
+    WHERE l.phone = ? AND a.business_id = ? AND a.status = 'scheduled'
     ORDER BY a.created_at DESC LIMIT 1
-  `).get(phone);
+  `).get(phone, businessId);
   return row || null;
 }
 
-// Format a stored start_time the EXACT same way booking does (UTC).
 function labelFromStartTime(startTime) {
   const d = new Date(startTime);
   if (isNaN(d.getTime())) return null;
@@ -301,7 +301,7 @@ function executeToolCall(toolName, toolInput, context) {
           timeZone: 'UTC'
         });
 
-        const carriedAddress = findMostRecentAddressForPhone(From);
+        const carriedAddress = findMostRecentAddressForPhone(From, business.id);
         let addressCarriedOver = false;
         if (carriedAddress) {
           if (setServiceAddress(bookResult.appointmentId, carriedAddress)) {
@@ -309,7 +309,7 @@ function executeToolCall(toolName, toolInput, context) {
           }
         }
 
-        const carriedName = findMostRecentNameForPhone(From);
+        const carriedName = findMostRecentNameForPhone(From, business.id);
         let nameCarriedOver = false;
         if (carriedName) {
           updateLead(lead.id, { name: carriedName });
@@ -539,12 +539,8 @@ Respond naturally. Use tools whenever you need real information or need to take 
   let guardrailTriggered = false;
   const leadAlreadyScheduled = lead.status === 'scheduled';
 
-  // Establish the SINGLE SOURCE OF TRUTH for this customer's active booking.
-  // Prefer facts verified this turn; otherwise read them straight from the DB.
-  // This survives across turns (unlike verifiedFacts, which resets every message),
-  // so the code/date/time can be validated even on the final turn where the AI
-  // reveals them after collecting name and address on earlier turns.
-  const activeAppt = findActiveAppointmentForPhone(From);
+  // Single source of truth for this customer's active booking, scoped to THIS business.
+  const activeAppt = findActiveAppointmentForPhone(From, business.id);
   const trueConfirmationCode =
     verifiedFacts.confirmationCode || (activeAppt ? activeAppt.confirmation_code : null);
   const trueAppointmentLabel =
@@ -577,10 +573,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
     guardrailTriggered = true;
   }
 
-  // 2. SURGICAL FACT REPLACEMENT — the AI writes the natural sentence,
-  // but every confirmation code, time, and day it states is overwritten
-  // with the true value from the database before sending. The AI cannot
-  // emit a wrong code/time/day because it never gets the final say on them.
+  // 2. SURGICAL FACT REPLACEMENT
   if (!guardrailTriggered) {
     // 2a. Confirmation code
     if (trueConfirmationCode) {
@@ -596,7 +589,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
         }
       }
     } else {
-      // No verifiable code exists but the AI is stating one → fail safe.
       const statesACode = /confirmation code\s*(?:is|:)/i.test(finalText);
       if (statesACode) {
         console.error(`[GUARDRAIL] lead=${lead.id} Message states a confirmation code but none could be verified. Holding message.`);
@@ -606,12 +598,11 @@ Respond naturally. Use tools whenever you need real information or need to take 
       }
     }
 
-    // 2b. Time and 2c. Day — only correct once we have a real booking to compare to.
+    // 2b. Time and 2c. Day
     if (trueAppointmentLabel) {
       const realTimeMatch = trueAppointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
       const realDayMatch = trueAppointmentLabel.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
 
-      // Replace any wrong time tokens with the real one.
       if (realTimeMatch) {
         const realTime = realTimeMatch[0].replace(/\s+/g, ' ').toUpperCase();
         const realTimeNorm = realTime.replace(/\s/g, '');
@@ -625,7 +616,6 @@ Respond naturally. Use tools whenever you need real information or need to take 
         });
       }
 
-      // Replace any wrong weekday tokens with the real one.
       if (realDayMatch) {
         const realDay = realDayMatch[1];
         finalText = finalText.replace(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi, (tok) => {

@@ -9,6 +9,19 @@ const { notifyOwner } = require('../services/notifyService');
 const { sendLeadNotification } = require('../services/emailService');
 const twilioAuth = require('../middleware/twilioAuth');
 
+// Find the business for an incoming call/text by the number it came in TO.
+// Falls back to the env number only if no match (eases single-business transition).
+function findBusinessByIncomingNumber(toNumber) {
+  let business = null;
+  if (toNumber) {
+    business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(toNumber);
+  }
+  if (!business && process.env.TWILIO_PHONE_NUMBER) {
+    business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(process.env.TWILIO_PHONE_NUMBER);
+  }
+  return business;
+}
+
 async function sendAndLog(leadId, to, message) {
   try {
     await sendSMS(to, message);
@@ -35,7 +48,6 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
 }
 
 // Updates the lead's urgency/type/summary for the dashboard. Does NOT send email.
-// Safe to call repeatedly as the conversation develops.
 async function runClassificationSafely(From, lead, business) {
   try {
     const freshLead = getLeadByPhone(From) || lead;
@@ -58,9 +70,8 @@ async function runClassificationSafely(From, lead, business) {
 async function sendNewLeadEmailOnce(From, lead, business) {
   try {
     const fresh = db.prepare('SELECT * FROM leads WHERE id = ?').get(lead.id);
-    if (!fresh || fresh.notified) return; // already emailed — never send again
+    if (!fresh || fresh.notified) return;
 
-    // Mark first to avoid any double-send if two messages arrive close together.
     updateLead(lead.id, { notified: 1 });
 
     await safeNotifyOwner(fresh);
@@ -73,9 +84,9 @@ async function sendNewLeadEmailOnce(From, lead, business) {
 
 router.post('/missed-call', twilioAuth, async (req, res) => {
   const { From, To, CallSid, CallStatus } = req.body;
-  console.log(`Call event - From: ${From}, Status: ${CallStatus}, SID: ${CallSid}`);
+  console.log(`Call event - From: ${From}, To: ${To}, Status: ${CallStatus}, SID: ${CallSid}`);
 
-  const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(To);
+  const business = findBusinessByIncomingNumber(To);
 
   if (!CallStatus || CallStatus === 'ringing' || CallStatus === 'in-progress') {
     if (business && business.business_phone) {
@@ -123,11 +134,11 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
 
 router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
   const { From, To, CallSid, DialCallStatus } = req.body;
-  console.log(`Forwarded call fallback - From: ${From}, DialStatus: ${DialCallStatus}`);
+  console.log(`Forwarded call fallback - From: ${From}, To: ${To}, DialStatus: ${DialCallStatus}`);
 
   if (DialCallStatus === 'no-answer' || DialCallStatus === 'busy' || DialCallStatus === 'failed') {
     try {
-      const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(To);
+      const business = findBusinessByIncomingNumber(To);
       const callId = uuidv4();
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
         .run(callId, From, To, CallSid, 'missed');
@@ -160,21 +171,21 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
 });
 
 router.post('/sms-reply', twilioAuth, async (req, res) => {
-  console.log('[SMS-WEBHOOK-FIELDS]', JSON.stringify(req.body));
-  const { From, Body } = req.body;
+  const { From, To, Body } = req.body;
   const text = Body.trim();
 
-  const business = db.prepare('SELECT * FROM businesses WHERE twilio_number = ?').get(process.env.TWILIO_PHONE_NUMBER);
+  // Route to the correct business by the number that was texted.
+  const business = findBusinessByIncomingNumber(To);
 
   let lead = getLeadByPhone(From);
 
-  // No active lead (new customer, or their previous lead was closed/deleted).
+  // No active lead (new customer, or previous lead closed/deleted).
   // Start a fresh lead so the AI engages and can rebook — instead of dead-ending.
   if (!lead) {
     try {
       const callId = uuidv4();
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
-        .run(callId, From, process.env.TWILIO_PHONE_NUMBER || 'unknown', `text-${callId}`, 'text-in');
+        .run(callId, From, To || (business ? business.twilio_number : 'unknown'), `text-${callId}`, 'text-in');
       const newLeadId = createLead(From, callId);
       lead = getLeadByPhone(From);
       if (!lead) {
@@ -202,7 +213,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
   if (!business) {
     await sendAndLog(lead.id, From, `Thanks for reaching out! A team member will get back to you shortly.`);
     updateLead(lead.id, { status: 'needs_followup' });
-    // Classify + send the single new-lead email (still once, even with no business).
     if (isFirstSubstantiveReply) {
       await runClassificationSafely(From, lead, business);
       await sendNewLeadEmailOnce(From, lead, business);
@@ -215,7 +225,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     reply = await runReceptionistConversation(business, lead, convo, text, From);
     await sendAndLog(lead.id, From, reply);
 
-    // Keep the dashboard classification fresh as the conversation develops.
     const leadAfterReply = getLeadByPhone(From);
     const statusChanged = leadAfterReply && leadAfterReply.status !== lead.status;
     const isMeaningfulMoment =
@@ -228,7 +237,6 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
       await runClassificationSafely(From, lead, business);
     }
 
-    // Send the new-lead alert email EXACTLY ONCE, on their first substantive message.
     if (isFirstSubstantiveReply) {
       await sendNewLeadEmailOnce(From, lead, business);
     }
