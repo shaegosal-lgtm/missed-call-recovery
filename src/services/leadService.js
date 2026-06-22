@@ -59,6 +59,40 @@ function leadHasActiveUpcomingAppointment(leadId) {
   return !!row;
 }
 
+// Returns the lead's active upcoming appointment (or null). Used by the popup
+// to show appointment details and decide whether to show a Cancel button.
+function getActiveUpcomingAppointmentForLead(leadId) {
+  const nowIso = new Date().toISOString();
+  return db.prepare(`
+    SELECT * FROM appointments
+    WHERE lead_id = ? AND status = 'scheduled' AND start_time > ?
+    ORDER BY start_time ASC LIMIT 1
+  `).get(leadId, nowIso) || null;
+}
+
+// Cancel a lead's upcoming appointment and close the lead, in one transaction.
+// Returns the cancelled appointment + the lead's phone so the caller can text
+// the customer. Does NOT send the SMS itself (kept side-effect-free here).
+function cancelLeadAppointment(leadId) {
+  const appt = getActiveUpcomingAppointmentForLead(leadId);
+  if (!appt) {
+    return { success: false, reason: 'no_active_appointment' };
+  }
+  const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(leadId);
+  if (!lead) {
+    return { success: false, reason: 'lead_not_found' };
+  }
+
+  const run = db.transaction(() => {
+    db.prepare(`UPDATE appointments SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .run(appt.id);
+    db.prepare(`UPDATE leads SET status = 'closed' WHERE id = ?`).run(leadId);
+  });
+  run();
+
+  return { success: true, appointment: appt, phone: lead.phone };
+}
+
 // Move a lead to the trash (soft delete). Returns a result object so the
 // route can tell the user WHY it failed if it's blocked.
 function deleteLead(id) {
@@ -143,6 +177,8 @@ module.exports = {
   getAllLeads,
   getDeletedLeads,
   leadHasActiveUpcomingAppointment,
+  getActiveUpcomingAppointmentForLead,
+  cancelLeadAppointment,
   deleteLead,
   recoverLead,
   permanentlyDeleteLead,
