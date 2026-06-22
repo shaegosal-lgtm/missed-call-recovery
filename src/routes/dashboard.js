@@ -6,7 +6,10 @@ const {
   deleteLead,
   recoverLead,
   permanentlyDeleteLead,
+  getActiveUpcomingAppointmentForLead,
+  cancelLeadAppointment,
 } = require('../services/leadService');
+const { sendSMS } = require('../services/twilioService');
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
@@ -112,6 +115,37 @@ function userCanAccessLead(req, leadId) {
   `).get(leadId, req.session.businessId);
   return !!row;
 }
+
+// Returns a lead's upcoming appointment (for the popup). null if none.
+router.get('/api/leads/:id/appointment', requireAuth, (req, res) => {
+  if (!userCanAccessLead(req, req.params.id)) return res.status(403).json({ error: 'forbidden' });
+  const appt = getActiveUpcomingAppointmentForLead(req.params.id);
+  res.json({ appointment: appt });
+});
+
+// Cancel a lead's upcoming appointment, close the lead, and text the customer.
+router.post('/api/leads/:id/cancel-appointment', requireAuth, async (req, res) => {
+  if (!userCanAccessLead(req, req.params.id)) return res.status(403).json({ error: 'forbidden' });
+
+  const result = cancelLeadAppointment(req.params.id);
+  if (!result.success) {
+    return res.json({ success: false, reason: result.reason });
+  }
+
+  // Notify the customer by SMS. If the text fails, the cancellation still stands.
+  try {
+    const startDate = new Date(result.appointment.start_time);
+    const when = startDate.toLocaleString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', timeZone: 'UTC'
+    });
+    await sendSMS(result.phone, `Your appointment on ${when} has been cancelled. If this was a mistake or you'd like to rebook, just reply here and we'll help.`);
+  } catch (err) {
+    console.error('[cancel-appointment] Failed to text customer, cancellation still applied:', err.message || err);
+  }
+
+  res.json({ success: true });
+});
 
 // Move selected leads to the trash. Skips any blocked by an active appointment.
 router.post('/api/leads/delete', requireAuth, (req, res) => {
@@ -489,7 +523,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
         </div>
       </div>
 
-      <div class="section ${'' /* select-mode class toggled on the list below */}">
+      <div class="section">
         <div class="lead-list" id="leads-list">
           ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : leadCards}
         </div>
@@ -564,12 +598,14 @@ router.get('/business/:id', requireAuth, (req, res) => {
         <span class="modal-close" onclick="closeModal()">×</span>
         <div class="modal-title" id="modal-title">Lead Details</div>
         <div id="modal-content"></div>
+        <div id="modal-appointment"></div>
       </div>
     </div>
 
     <script>
       const leads = JSON.parse(\`${leadData}\`);
       const selectMode = { leads: false, deleted: false };
+      let currentLeadId = null;
 
       function switchTab(tabName, btn) {
         document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -623,7 +659,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
         });
         const data = await r.json();
         if (data.blocked && data.blocked.length > 0) {
-          alert(data.deleted + ' moved to trash. ' + data.blocked.length + ' could not be deleted because they have an upcoming appointment. Cancel the appointment first.');
+          alert(data.deleted + ' moved to trash. ' + data.blocked.length + ' could not be deleted because they have an upcoming appointment. Cancel the appointment first (open the lead to cancel it).');
         }
         location.reload();
       }
@@ -653,6 +689,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
       async function showLead(id) {
         const lead = leads.find(l => l.id === id);
         if (!lead) return;
+        currentLeadId = id;
 
         let convoHtml = '';
         try {
@@ -672,6 +709,30 @@ router.get('/business/:id', requireAuth, (req, res) => {
           '<div class="field"><div class="field-label">AI Summary</div><div class="field-value">' + (lead.ai_summary || 'Not classified yet') + '</div></div>' +
           '<div class="field"><div class="field-label">Conversation</div><div class="convo">' + (convoHtml || 'No messages yet') + '</div></div>';
 
+        // Load the appointment (if any) and show a Cancel button.
+        const apptBox = document.getElementById('modal-appointment');
+        apptBox.innerHTML = '<div class="appt-loading">Checking for appointments…</div>';
+        try {
+          const r = await fetch('/dashboard/api/leads/' + id + '/appointment');
+          const data = await r.json();
+          if (data.appointment) {
+            const a = data.appointment;
+            const start = new Date(a.start_time);
+            const when = start.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC' });
+            apptBox.innerHTML =
+              '<div class="appt-callout">' +
+                '<div class="appt-callout-label">Upcoming appointment</div>' +
+                '<div class="appt-callout-when">' + when + '</div>' +
+                (a.confirmation_code ? '<div class="appt-callout-code">Code: ' + a.confirmation_code + '</div>' : '') +
+                '<button class="btn-danger" style="margin-top:12px" onclick="cancelAppointment()">Cancel appointment</button>' +
+              '</div>';
+          } else {
+            apptBox.innerHTML = '';
+          }
+        } catch (e) {
+          apptBox.innerHTML = '';
+        }
+
         document.getElementById('modal').classList.add('active');
 
         const row = document.querySelector('[data-lead-id="' + id + '"]');
@@ -685,8 +746,23 @@ router.get('/business/:id', requireAuth, (req, res) => {
         }
       }
 
+      async function cancelAppointment() {
+        if (!currentLeadId) return;
+        const ok = confirm('Cancel this appointment? The customer will be texted to let them know.');
+        if (!ok) return;
+        const r = await fetch('/dashboard/api/leads/' + currentLeadId + '/cancel-appointment', { method: 'POST' });
+        const data = await r.json();
+        if (data.success) {
+          alert('Appointment cancelled and the customer was notified.');
+          location.reload();
+        } else {
+          alert('Could not cancel: ' + (data.reason || 'unknown error'));
+        }
+      }
+
       function closeModal() {
         document.getElementById('modal').classList.remove('active');
+        currentLeadId = null;
       }
 
       document.getElementById('modal').addEventListener('click', function(e) {
@@ -801,6 +877,12 @@ function renderPage(title, content, role) {
       .lead-body { display: flex; align-items: flex-start; gap: 14px; flex: 1; min-width: 0; cursor: pointer; }
 
       .deleted-note { background: var(--blue-light); border: 1px solid #CFE2FB; color: var(--gray-700); border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 16px; }
+
+      .appt-callout { background: var(--gray-50); border: 1px solid var(--gray-100); border-radius: 10px; padding: 16px; margin-top: 16px; }
+      .appt-callout-label { font-size: 11px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; margin-bottom: 6px; }
+      .appt-callout-when { font-size: 15px; font-weight: 700; color: var(--navy); }
+      .appt-callout-code { font-size: 13px; color: var(--gray-500); margin-top: 4px; font-family: monospace; }
+      .appt-loading { font-size: 13px; color: var(--gray-500); margin-top: 16px; }
 
       .lead-list { display: flex; flex-direction: column; }
       .lead-row { display: flex; align-items: flex-start; gap: 8px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); transition: background 0.15s; position: relative; }

@@ -1,989 +1,669 @@
-const express = require('express');
-const router = express.Router();
-const bcrypt = require('bcryptjs');
-const db = require('../db/db');
+const Anthropic = require('@anthropic-ai/sdk');
 const {
-  deleteLead,
-  recoverLead,
-  permanentlyDeleteLead,
-  getActiveUpcomingAppointmentForLead,
-  cancelLeadAppointment,
-} = require('../services/leadService');
-const { sendSMS } = require('../services/twilioService');
+  getAvailableSlots,
+  getNextAvailableDays,
+  bookAppointment,
+  cancelAppointment,
+  getAppointmentByPhone,
+  formatDate,
+} = require('./schedulingService');
+const { updateLead } = require('./leadService');
+const db = require('../db/db');
 
-function requireAdmin(req, res, next) {
-  if (req.session && req.session.role === 'admin') return next();
-  res.redirect('/dashboard/login');
-}
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-function requireAuth(req, res, next) {
-  if (req.session && (req.session.role === 'admin' || req.session.role === 'business')) return next();
-  res.redirect('/dashboard/login');
-}
-
-router.get('/login', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Login</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        :root {
-          --navy: #0D1B2A;
-          --blue: #1A6FDB;
-          --blue-light: #EBF3FF;
-          --sky: #4A9FFF;
-          --gray-50: #F8FAFC;
-          --gray-100: #F1F5F9;
-          --gray-300: #CBD5E1;
-          --gray-500: #64748B;
-          --gray-700: #334155;
+const TOOLS = [
+  {
+    name: 'check_availability',
+    description: 'Check real available appointment slots for a specific date. Always use this before telling a customer about availability - never guess or make up times. Returns up to 5 available time slots, each with a slot_id you must use later to book.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date: {
+          type: 'string',
+          description: 'The date to check in YYYY-MM-DD format. You MUST copy this exactly from the DATE LOOKUP TABLE provided in your instructions - never calculate this yourself.'
+        },
+        time_of_day: {
+          type: 'string',
+          enum: ['morning', 'afternoon', 'evening', 'any'],
+          description: 'Filter by time of day if specified, otherwise "any".'
         }
-        body { font-family: -apple-system, sans-serif; background: var(--gray-50); display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 24px rgba(13,27,42,0.08); width: 100%; max-width: 400px; }
-        h1 { font-size: 22px; margin-bottom: 8px; color: var(--navy); font-weight: 800; letter-spacing: -0.5px; }
-        h1 span { color: var(--blue); }
-        p { color: var(--gray-500); font-size: 14px; margin-bottom: 24px; }
-        label { display: block; font-size: 13px; font-weight: 500; color: var(--gray-700); margin-bottom: 6px; }
-        input { width: 100%; padding: 10px 14px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 15px; margin-bottom: 16px; }
-        button { width: 100%; padding: 12px; background: var(--blue); color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; }
-        button:hover { background: #1560C0; }
-        .error { color: #e53e3e; font-size: 13px; margin-bottom: 16px; background: #fff5f5; padding: 10px 12px; border-radius: 6px; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>Missed<span>Pro</span></h1>
-        <p>Sign in to your dashboard</p>
-        ${req.query.error ? '<p class="error">Invalid username or password. Please try again.</p>' : ''}
-        <form method="POST" action="/dashboard/login">
-          <label>Username</label>
-          <input type="text" name="username" placeholder="Enter your username" autofocus autocomplete="username">
-          <label>Password</label>
-          <input type="password" name="password" placeholder="Enter your password" autocomplete="current-password">
-          <button type="submit">Sign in</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-router.post('/login', async (req, res) => {
-  const { username, password } = req.body;
-
-  if (username === 'admin' && password === process.env.ADMIN_KEY) {
-    req.session.role = 'admin';
-    req.session.authenticated = true;
-    return res.redirect('/dashboard');
-  }
-
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (user) {
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (valid) {
-      req.session.role = 'business';
-      req.session.businessId = user.business_id;
-      req.session.authenticated = true;
-      return res.redirect('/dashboard');
+      },
+      required: ['date', 'time_of_day']
     }
+  },
+  {
+    name: 'book_appointment',
+    description: 'Book a specific appointment slot using its slot_id. You must use the exact slot_id returned by a previous check_availability call for the slot the customer chose - never type out or guess a timestamp yourself.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        slot_id: {
+          type: 'string',
+          description: 'The exact slot_id value from a previous check_availability result, corresponding to the time the customer confirmed.'
+        }
+      },
+      required: ['slot_id']
+    }
+  },
+  {
+    name: 'cancel_appointment',
+    description: 'Cancel the customer\'s existing appointment.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'save_customer_info',
+    description: 'Save the customer service address when they provide it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: 'The full service address.' }
+      },
+      required: ['address']
+    }
+  },
+  {
+    name: 'save_customer_name',
+    description: 'Save the customer name once they provide it after booking. Call this as soon as the customer gives their name.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The customer\'s name as they provided it.' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'flag_needs_followup',
+    description: 'Flag this conversation as needing human follow-up. Use only when something genuinely cannot be handled.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        reason: { type: 'string', description: 'Brief reason for follow-up.' }
+      },
+      required: ['reason']
+    }
+  },
+  {
+    name: 'mark_conversation_closed',
+    description: 'Mark this conversation as closed/resolved with no further action needed. Call this ONLY when the customer has clearly declined service and is not booking an appointment (e.g. "not interested", "no thanks", "I found someone else", "just wanted pricing, that\'s it"). Do not call this if they might still want to book, or if a human needs to follow up with them.',
+    input_schema: { type: 'object', properties: {} }
   }
+];
 
-  res.redirect('/dashboard/login?error=1');
-});
+const slotCache = new Map();
 
-router.get('/logout', (req, res) => {
-  req.session.destroy();
-  res.redirect('/dashboard/login');
-});
-
-router.post('/api/leads/:id/view', requireAuth, (req, res) => {
-  db.prepare('UPDATE leads SET viewed = 1 WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
-});
-
-// Confirms a lead belongs to the logged-in user (admins can touch any lead).
-function userCanAccessLead(req, leadId) {
-  if (req.session.role === 'admin') return true;
-  const row = db.prepare(`
-    SELECT l.id FROM leads l
-    JOIN calls c ON l.call_id = c.id
-    JOIN businesses b ON c.to_number = b.twilio_number
-    WHERE l.id = ? AND b.id = ?
-  `).get(leadId, req.session.businessId);
-  return !!row;
+function cacheSlot(leadId, isoString) {
+  const slotId = `slot_${Math.random().toString(36).substring(2, 10)}`;
+  const key = `${leadId}:${slotId}`;
+  slotCache.set(key, isoString);
+  return slotId;
 }
 
-// Returns a lead's upcoming appointment (for the popup). null if none.
-router.get('/api/leads/:id/appointment', requireAuth, (req, res) => {
-  if (!userCanAccessLead(req, req.params.id)) return res.status(403).json({ error: 'forbidden' });
-  const appt = getActiveUpcomingAppointmentForLead(req.params.id);
-  res.json({ appointment: appt });
-});
+function resolveSlot(leadId, slotId) {
+  const key = `${leadId}:${slotId}`;
+  return slotCache.get(key) || null;
+}
 
-// Cancel a lead's upcoming appointment, close the lead, and text the customer.
-router.post('/api/leads/:id/cancel-appointment', requireAuth, async (req, res) => {
-  if (!userCanAccessLead(req, req.params.id)) return res.status(403).json({ error: 'forbidden' });
+function buildDateLookupTable() {
+  const today = new Date();
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const lines = [];
 
-  const result = cancelLeadAppointment(req.params.id);
-  if (!result.success) {
-    return res.json({ success: false, reason: result.reason });
+  for (let i = 0; i <= 20; i++) {
+    const d = new Date(today);
+    d.setUTCDate(today.getUTCDate() + i);
+    const dateStr = d.toISOString().split('T')[0];
+    const dayName = dayNames[d.getUTCDay()];
+
+    let label = `${dayName} ${dateStr}`;
+    if (i === 0) label += ' (TODAY)';
+    if (i === 1) label += ' (TOMORROW)';
+    lines.push(label);
   }
 
-  // Notify the customer by SMS. If the text fails, the cancellation still stands.
+  return lines.join('\n');
+}
+
+async function classifyLead(phone, conversationHistory) {
+  const convoText = conversationHistory
+    .filter(m => m.role === 'customer' || m.role === 'assistant')
+    .map(m => `${m.role === 'customer' ? 'Customer' : 'Receptionist'}: ${m.body}`)
+    .join('\n');
+
+  const prompt = `You are helping a small appointment-based business qualify a missed call lead based on their FULL conversation so far.
+
+Phone: ${phone}
+
+CONVERSATION:
+${convoText}
+
+Respond ONLY with a valid JSON object (no markdown, no explanation) in this exact format:
+{
+  "urgency": "low" | "medium" | "high",
+  "lead_type": "new_patient" | "existing" | "appointment" | "billing" | "other",
+  "summary": "one or two sentences for the front desk summarizing the full situation, not just the opening message"
+}
+
+URGENCY GUIDE - base this on the ENTIRE conversation, not just the first message:
+- HIGH: genuine emergency, active damage/danger, customer expresses significant distress or time pressure, repeated urgency cues, safety issue
+- MEDIUM: wants service relatively soon, mild inconvenience, no emergency language, standard scheduling request
+- LOW: general inquiry, pricing question only, no clear timeline, browsing/considering, or customer seems to have lost interest
+
+Consider tone, repeated frustration, explicit urgency language ("ASAP", "right now", "emergency", "flooding", "can't wait"), and how the conversation evolved - not just the first sentence.`;
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 250,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
   try {
-    const startDate = new Date(result.appointment.start_time);
-    const when = startDate.toLocaleString('en-US', {
-      weekday: 'long', month: 'long', day: 'numeric',
-      hour: 'numeric', minute: '2-digit', timeZone: 'UTC'
-    });
-    await sendSMS(result.phone, `Your appointment on ${when} has been cancelled. If this was a mistake or you'd like to rebook, just reply here and we'll help.`);
-  } catch (err) {
-    console.error('[cancel-appointment] Failed to text customer, cancellation still applied:', err.message || err);
+    return JSON.parse(response.content[0].text);
+  } catch {
+    return { urgency: 'medium', lead_type: 'other', summary: convoText.slice(0, 150) };
   }
+}
 
-  res.json({ success: true });
-});
+function logToolCall(leadId, toolName, input, result) {
+  console.log(`[TOOL_CALL] lead=${leadId} tool=${toolName} input=${JSON.stringify(input)} result=${JSON.stringify(result)}`);
+}
 
-// Move selected leads to the trash. Skips any blocked by an active appointment.
-router.post('/api/leads/delete', requireAuth, (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-  let deleted = 0;
-  const blocked = [];
-  for (const id of ids) {
-    if (!userCanAccessLead(req, id)) continue;
-    const result = deleteLead(id);
-    if (result.success) deleted++;
-    else if (result.reason === 'has_active_appointment') blocked.push(id);
+// ---- Schema-safe helpers -------------------------------------------------
+// The appointments table may or may not have service_address / address_confirmed
+// columns depending on migrations. Detect once so queries never throw.
+const appointmentColumns = (() => {
+  try {
+    return new Set(db.prepare(`PRAGMA table_info(appointments)`).all().map(c => c.name));
+  } catch {
+    return new Set();
   }
-  res.json({ success: true, deleted, blocked });
-});
+})();
+const HAS_SERVICE_ADDRESS = appointmentColumns.has('service_address');
+const HAS_ADDRESS_CONFIRMED = appointmentColumns.has('address_confirmed');
 
-// Recover selected leads from the trash.
-router.post('/api/leads/recover', requireAuth, (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-  let recovered = 0;
-  for (const id of ids) {
-    if (!userCanAccessLead(req, id)) continue;
-    const result = recoverLead(id);
-    if (result.success) recovered++;
+function findMostRecentAddressForPhone(phone) {
+  if (!HAS_SERVICE_ADDRESS) return null;
+  try {
+    const confirmedClause = HAS_ADDRESS_CONFIRMED ? 'AND a.address_confirmed = 1' : '';
+    const row = db.prepare(`
+      SELECT a.service_address FROM appointments a
+      JOIN leads l ON a.lead_id = l.id
+      WHERE l.phone = ? AND a.service_address IS NOT NULL ${confirmedClause}
+      ORDER BY a.created_at DESC LIMIT 1
+    `).get(phone);
+    return row ? row.service_address : null;
+  } catch {
+    return null;
   }
-  res.json({ success: true, recovered });
-});
+}
 
-// Permanently erase selected trashed leads (and their appointments).
-router.post('/api/leads/permanent-delete', requireAuth, (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-  let erased = 0;
-  for (const id of ids) {
-    if (!userCanAccessLead(req, id)) continue;
-    const result = permanentlyDeleteLead(id);
-    if (result.success) erased++;
-  }
-  res.json({ success: true, erased });
-});
+function findMostRecentNameForPhone(phone) {
+  const row = db.prepare(`
+    SELECT name FROM leads
+    WHERE phone = ? AND name IS NOT NULL
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phone);
+  return row ? row.name : null;
+}
 
-router.get('/', requireAuth, (req, res) => {
-  if (req.session.role === 'admin') {
-    const businesses = db.prepare('SELECT * FROM businesses ORDER BY created_at DESC').all();
-
-    const businessCards = businesses.map(b => {
-      const leadCount = db.prepare(`
-        SELECT COUNT(*) as count FROM leads WHERE deleted_at IS NULL AND call_id IN (
-          SELECT id FROM calls WHERE to_number = ?
-        )
-      `).get(b.twilio_number).count;
-
-      const apptCount = db.prepare(`
-        SELECT COUNT(*) as count FROM appointments WHERE business_id = ? AND status = 'scheduled'
-      `).get(b.id).count;
-
-      return `
-        <a href="/dashboard/business/${b.id}" class="biz-card">
-          <div class="biz-card-header">
-            <div>
-              <div class="biz-card-title">${b.name}</div>
-              <div class="biz-card-sub">${b.twilio_number}</div>
-            </div>
-            <div class="pill">${leadCount} leads</div>
-          </div>
-          <div class="biz-card-stats">
-            <div class="mini-stat"><span class="mini-stat-num">${leadCount}</span><span class="mini-stat-label">Total Leads</span></div>
-            <div class="mini-stat"><span class="mini-stat-num">${apptCount}</span><span class="mini-stat-label">Upcoming Appts</span></div>
-          </div>
-        </a>
-      `;
-    }).join('');
-
-    return res.send(renderPage('Admin Dashboard', `
-      <h2>Businesses</h2>
-      ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : `<div class="biz-grid">${businessCards}</div>`}
-    `, 'admin'));
-  }
-
-  res.redirect(`/dashboard/business/${req.session.businessId}`);
-});
-
-router.get('/business/:id', requireAuth, (req, res) => {
-  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
-    return res.redirect('/dashboard');
-  }
-
-  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
-  if (!business) return res.redirect('/dashboard');
-
-  // LIVE leads (not trashed)
-  const leads = db.prepare(`
-    SELECT * FROM leads WHERE deleted_at IS NULL AND call_id IN (
-      SELECT id FROM calls WHERE to_number = ?
-    ) ORDER BY created_at DESC
-  `).all(business.twilio_number);
-
-  // TRASHED leads
-  const deletedLeads = db.prepare(`
-    SELECT * FROM leads WHERE deleted_at IS NOT NULL AND call_id IN (
-      SELECT id FROM calls WHERE to_number = ?
-    ) ORDER BY deleted_at DESC
-  `).all(business.twilio_number);
-
-  const appointments = db.prepare(`
-    SELECT a.*, l.name as lead_name, l.phone FROM appointments a
+// The single source of truth for an active booking: pulls the real
+// confirmation code AND real start_time straight from the database.
+function findActiveAppointmentForPhone(phone) {
+  const row = db.prepare(`
+    SELECT a.confirmation_code, a.start_time FROM appointments a
     JOIN leads l ON a.lead_id = l.id
-    WHERE a.business_id = ?
-    ORDER BY a.start_time ASC
-  `).all(business.id);
+    WHERE l.phone = ? AND a.status = 'scheduled'
+    ORDER BY a.created_at DESC LIMIT 1
+  `).get(phone);
+  return row || null;
+}
 
-  const now = new Date();
-  const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+// Format a stored start_time the EXACT same way booking does (UTC).
+function labelFromStartTime(startTime) {
+  const d = new Date(startTime);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZone: 'UTC'
+  });
+}
 
-  const leadsThisMonth = leads.filter(l => l.created_at >= firstOfMonth.replace('T', ' ').substring(0, 19));
-  const apptsThisMonth = appointments.filter(a => a.created_at >= firstOfMonth.replace('T', ' ').substring(0, 19) && a.status !== 'cancelled');
+function setServiceAddress(appointmentId, address) {
+  if (!HAS_SERVICE_ADDRESS) return false;
+  try {
+    const confirmedSet = HAS_ADDRESS_CONFIRMED ? ', address_confirmed = 1' : '';
+    db.prepare(`UPDATE appointments SET service_address = ?${confirmedSet} WHERE id = ?`)
+      .run(address, appointmentId);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const totalLeadsAllTime = leads.length;
-  const totalApptsAllTime = appointments.filter(a => a.status !== 'cancelled').length;
-  const conversionRate = totalLeadsAllTime > 0 ? Math.round((totalApptsAllTime / totalLeadsAllTime) * 100) : 0;
-  const avgJobValue = business.avg_job_value || 150;
-  const revenueRecoveredMonth = apptsThisMonth.length * avgJobValue;
-  const revenueRecoveredAllTime = totalApptsAllTime * avgJobValue;
+function executeToolCall(toolName, toolInput, context) {
+  const { business, lead, From } = context;
+  let result;
 
-  const urgencyBreakdown = {
-    high: leads.filter(l => l.urgency === 'high').length,
-    medium: leads.filter(l => l.urgency === 'medium').length,
-    low: leads.filter(l => l.urgency === 'low').length,
+  if (toolName === 'check_availability') {
+    const { date, time_of_day } = toolInput;
+    let slots = getAvailableSlots(business.id, date);
+
+    if (time_of_day === 'morning') slots = slots.filter(s => s.slotHour < 12);
+    else if (time_of_day === 'afternoon') slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
+    else if (time_of_day === 'evening') slots = slots.filter(s => s.slotHour >= 17);
+
+    if (slots.length === 0) {
+      const available = getNextAvailableDays(business.id, 14);
+      if (available.length === 0) {
+        result = { available: false, message: 'No availability in the next two weeks.' };
+      } else {
+        const next = available[0];
+        const offeredSlots = next.slots.slice(0, 5);
+        result = {
+          available: true,
+          requested_date_had_availability: false,
+          next_available_date: next.date,
+          next_available_date_formatted: formatDate(next.date),
+          slots: offeredSlots.map(s => ({
+            slot_id: cacheSlot(lead.id, s.start.toISOString()),
+            label: s.label
+          }))
+        };
+      }
+    } else {
+      const offeredSlots = slots.slice(0, 5);
+      result = {
+        available: true,
+        requested_date_had_availability: true,
+        date_formatted: formatDate(date),
+        slots: offeredSlots.map(s => ({
+          slot_id: cacheSlot(lead.id, s.start.toISOString()),
+          label: s.label
+        }))
+      };
+    }
+  } else if (toolName === 'book_appointment') {
+    const realIso = resolveSlot(lead.id, toolInput.slot_id);
+    if (!realIso) {
+      result = { success: false, message: 'That slot reference is no longer valid. Please check availability again.' };
+    } else {
+      const bookResult = bookAppointment(business.id, lead.id, realIso);
+      if (!bookResult.success) {
+        result = { success: false, message: 'That slot was just taken by someone else.' };
+      } else {
+        updateLead(lead.id, { status: 'scheduled' });
+        const startDate = new Date(realIso);
+        const label = startDate.toLocaleString('en-US', {
+          weekday: 'long', month: 'long', day: 'numeric',
+          hour: 'numeric', minute: '2-digit',
+          timeZone: 'UTC'
+        });
+
+        const carriedAddress = findMostRecentAddressForPhone(From);
+        let addressCarriedOver = false;
+        if (carriedAddress) {
+          if (setServiceAddress(bookResult.appointmentId, carriedAddress)) {
+            addressCarriedOver = true;
+          }
+        }
+
+        const carriedName = findMostRecentNameForPhone(From);
+        let nameCarriedOver = false;
+        if (carriedName) {
+          updateLead(lead.id, { name: carriedName });
+          nameCarriedOver = true;
+        }
+
+        result = {
+          success: true,
+          confirmation_code: bookResult.confirmationCode,
+          appointment_label: label,
+          address_carried_over: addressCarriedOver,
+          carried_over_address: addressCarriedOver ? carriedAddress : null,
+          name_carried_over: nameCarriedOver,
+          carried_over_name: nameCarriedOver ? carriedName : null
+        };
+      }
+    }
+  } else if (toolName === 'cancel_appointment') {
+    const appt = getAppointmentByPhone(From);
+    if (!appt) {
+      result = { success: false, message: 'No active appointment found for this customer.' };
+    } else {
+      cancelAppointment(appt.id);
+      result = { success: true };
+    }
+  } else if (toolName === 'save_customer_info') {
+    const appt = getAppointmentByPhone(From);
+    if (appt) {
+      const ok = setServiceAddress(appt.id, toolInput.address);
+      result = ok ? { success: true } : { success: false, message: 'Could not save address.' };
+    } else {
+      result = { success: false, message: 'No active appointment found to attach address to.' };
+    }
+  } else if (toolName === 'save_customer_name') {
+    updateLead(lead.id, { name: toolInput.name });
+    result = { success: true };
+  } else if (toolName === 'flag_needs_followup') {
+    updateLead(lead.id, { status: 'needs_followup' });
+    result = { success: true, flagged: true };
+  } else if (toolName === 'mark_conversation_closed') {
+    updateLead(lead.id, { status: 'closed' });
+    result = { success: true, closed: true };
+  } else {
+    result = { error: 'Unknown tool' };
+  }
+
+  logToolCall(lead.id, toolName, toolInput, result);
+  return result;
+}
+
+async function runReceptionistConversation(business, lead, conversationHistory, customerMessage, From) {
+  const businessInfo = business.business_info || 'No specific business information provided.';
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const dayName = today.toLocaleDateString('en-US', { weekday: 'long' });
+  const dateLookupTable = buildDateLookupTable();
+
+  const filteredHistory = conversationHistory
+    .filter(m => m.role === 'customer' || m.role === 'assistant')
+    .map(m => ({
+      role: m.role === 'customer' ? 'user' : 'assistant',
+      content: m.body
+    }));
+
+  const leadWasAlreadyScheduled = lead.status === 'scheduled';
+
+  const systemPrompt = `You are an automated AI receptionist for ${business.name}, a service business. You communicate with customers via SMS after they had a missed call.
+
+TODAY'S DATE: ${dayName}, ${todayStr}
+
+DATE LOOKUP TABLE - YOU MUST USE THIS, NEVER CALCULATE DATES YOURSELF:
+${dateLookupTable}
+
+When a customer mentions a day, find the matching line in the table above and use that EXACT date string. If the customer says "next [day]", use the SECOND occurrence of that day name. If they just say a day name with no "next", use the FIRST occurrence.
+
+BUSINESS INFORMATION:
+${businessInfo}
+
+WHAT YOU KNOW ABOUT THIS CUSTOMER:
+- Phone: ${lead.phone} (never ask for this)
+- Reason for calling: ${lead.reason || 'not yet known'}
+${leadWasAlreadyScheduled ? '- This customer ALREADY HAS A CONFIRMED APPOINTMENT booked from earlier in this conversation. Do not re-book, do not act unsure about whether it is confirmed, and do not call check_availability or book_appointment again unless they explicitly ask to reschedule or book an additional appointment. If they ask general questions, just answer them normally - their appointment remains confirmed regardless.' : ''}
+
+CRITICAL GROUNDING RULE:
+You must NEVER state a specific date, time, confirmation code, "booked", "confirmed", "cancelled", or "saved" status unless you JUST received that EXACT information back from a tool result earlier in THIS SAME response chain, OR it was already established as fact earlier in the conversation. Never guess, estimate, restate from memory incorrectly, infer, or fabricate any of these details.
+
+HANDLING UNAVAILABLE DAYS:
+If a customer asks about a specific day and check_availability shows requested_date_had_availability: false, it means that day has no openings. Be honest and natural about this: explain that day isn't available and offer the next_available_date_formatted instead.
+
+SLOT BOOKING RULE:
+When you call book_appointment, you MUST use the exact slot_id value from a previous check_availability result.
+
+NAME AND ADDRESS HANDLING - ONLY COLLECTED AT BOOKING TIME:
+Do NOT ask for the customer's name or address at any point before they have confirmed a specific appointment slot. Only after book_appointment succeeds do you collect this information.
+
+CRITICAL: Never state the confirmation code in the same message where you are still asking for missing name or address information. The confirmation code should ONLY appear in a message once name and address are both fully resolved (either carried over or freshly collected).
+
+When book_appointment succeeds, check the result for name_carried_over and address_carried_over:
+- If BOTH are true: mention both naturally and give the confirmation code in this same message, e.g. "Great, we'll see [name] at [address]! Confirmation code is..."
+- If only ONE is true: acknowledge the one on file, then ask for the missing one. Do NOT mention the confirmation code yet - wait until you have the missing piece.
+- If NEITHER is true: ask for the customer's name first ("Great, you're booked in! Can I get your name?") with NO confirmation code in this message. Once they provide it, call save_customer_name, then ask for the service address with NO confirmation code yet. Once they provide that, call save_customer_info, then give the confirmation code in that final message.
+- Ask for name and address as two separate, sequential questions - never both in the same message, and never alongside the confirmation code until both are resolved.
+
+CLOSING A CONVERSATION:
+If the customer clearly declines service (says "not interested", "no thanks", "I'll go elsewhere", or similar, and is NOT booking an appointment), call mark_conversation_closed after responding warmly.
+
+CORE BEHAVIOR RULES:
+1. Be warm, concise, and natural - like a real, competent receptionist texting back. No corporate jargon.
+2. Keep messages under 320 characters. Be concise.
+3. No emojis.
+4. One question at a time.
+5. When a customer wants to book: find the correct date using the DATE LOOKUP TABLE, then call check_availability.
+6. Present at most 3 options using the EXACT wording/times the tool returned.
+7. If the customer rejects options or wants different times, call check_availability again with adjusted parameters.
+8. Once confirmed, call book_appointment with the matching slot_id.
+9. After book_appointment succeeds, follow the NAME AND ADDRESS HANDLING rules above before giving the confirmation code.
+10. When the customer gives a NEW address, call save_customer_info. When they give a NEW name, call save_customer_name. Then state the confirmation code exactly as returned, and the appointment time exactly as returned in appointment_label.
+11. If the customer prefers a callback instead of giving name/address, call flag_needs_followup, then state the confirmation code exactly as returned.
+12. If the customer wants to cancel, call cancel_appointment, then only confirm if success:true.
+13. For questions answerable from business information, answer directly.
+14. For anything you cannot answer, call flag_needs_followup, then let them know a team member will follow up.
+15. Never claim to be human if asked.
+16. Never repeat a message already sent in this conversation.
+17. Acknowledge urgency briefly, then prioritize booking quickly.
+18. If a customer already has a confirmed appointment and asks something unrelated, just answer naturally.
+19. If a customer's message contains multiple pieces of information at once, parse each piece separately, especially the requested day, using the DATE LOOKUP TABLE.
+
+Respond naturally. Use tools whenever you need real information or need to take an action - never simulate what a tool would return.`;
+
+  const messages = [...filteredHistory, { role: 'user', content: customerMessage }];
+
+  let finalText = '';
+  let iterations = 0;
+  const maxIterations = 6;
+
+  const verifiedFacts = {
+    bookedThisTurn: false,
+    confirmationCode: null,
+    appointmentLabel: null,
+    addressSavedThisTurn: false,
+    addressSaveFailed: false,
+    addressCarriedOverThisTurn: false,
+    nameSavedThisTurn: false,
+    nameCarriedOverThisTurn: false,
+    cancelledThisTurn: false,
+    cancelFailed: false,
+    lastCheckAvailabilityDate: null,
+    lastCheckAvailabilityDateFormatted: null,
+    lastCheckHadRequestedAvailability: false,
+    closedThisTurn: false,
   };
 
-  const last7Days = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const dayStr = d.toISOString().split('T')[0];
-    const count = leads.filter(l => l.created_at.startsWith(dayStr)).length;
-    last7Days.push({ label: d.toLocaleDateString('en-US', { weekday: 'short' }), count });
-  }
-  const maxDayCount = Math.max(...last7Days.map(d => d.count), 1);
+  while (iterations < maxIterations) {
+    iterations++;
 
-  function initials(name, phone) {
-    if (name) {
-      const parts = name.trim().split(' ');
-      return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
-    }
-    return phone.slice(-2);
-  }
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1024,
+      system: systemPrompt,
+      tools: TOOLS,
+      messages,
+    });
 
-  const leadCards = leads.map(l => {
-    const isNew = !l.viewed;
-    return `
-    <div class="lead-row ${isNew ? 'is-new' : ''}" data-lead-id="${l.id}">
-      <input type="checkbox" class="row-check leads-check" value="${l.id}" onclick="event.stopPropagation()">
-      ${isNew ? '<div class="new-dot"></div>' : ''}
-      <div class="lead-body" onclick="showLead('${l.id}')">
-        <div class="lead-avatar">${initials(l.name, l.phone)}</div>
-        <div class="lead-main">
-          <div class="lead-name-line">
-            <span class="lead-name">${l.name || 'Unknown Caller'}</span>
-            <span class="lead-date">${new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
-          </div>
-          <div class="lead-phone">${l.phone}</div>
-          <div class="lead-summary">${l.ai_summary || l.reason || 'No summary yet'}</div>
-        </div>
-        <div class="lead-tags">
-          <span class="tag-lg urgency-${l.urgency}">${l.urgency}</span>
-          <span class="tag-lg status-${l.status}">${l.status}</span>
-        </div>
-      </div>
-    </div>
-  `}).join('');
+    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+    const textBlocks = response.content.filter(b => b.type === 'text');
 
-  const deletedCards = deletedLeads.map(l => {
-    const deletedDate = new Date(l.deleted_at);
-    const purgeDate = new Date(deletedDate.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const daysLeft = Math.max(0, Math.ceil((purgeDate - now) / (1000 * 60 * 60 * 24)));
-    return `
-    <div class="lead-row" data-lead-id="${l.id}">
-      <input type="checkbox" class="row-check deleted-check" value="${l.id}" onclick="event.stopPropagation()">
-      <div class="lead-body" onclick="showLead('${l.id}')">
-        <div class="lead-avatar" style="background:var(--gray-500)">${initials(l.name, l.phone)}</div>
-        <div class="lead-main">
-          <div class="lead-name-line">
-            <span class="lead-name">${l.name || 'Unknown Caller'}</span>
-            <span class="lead-date">Deleted ${deletedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
-          </div>
-          <div class="lead-phone">${l.phone}</div>
-          <div class="lead-summary">Auto-erases in ${daysLeft} day${daysLeft === 1 ? '' : 's'}</div>
-        </div>
-      </div>
-    </div>
-  `}).join('');
-
-  // ===== APPOINTMENTS TAB ENHANCEMENT =====
-  const nowMs = Date.now();
-  const todayStr = new Date().toISOString().split('T')[0];
-  const tomorrowDate = new Date();
-  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-  const tomorrowStr = tomorrowDate.toISOString().split('T')[0];
-
-  const activeAppts = appointments.filter(a => a.status !== 'cancelled');
-  const upcomingAppts = activeAppts
-    .filter(a => new Date(a.start_time).getTime() >= nowMs)
-    .sort((a, b) => new Date(a.start_time) - new Date(b.start_time));
-  const pastAppts = activeAppts
-    .filter(a => new Date(a.start_time).getTime() < nowMs)
-    .sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
-  const cancelledAppts = appointments
-    .filter(a => a.status === 'cancelled')
-    .sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
-
-  const upcomingThisWeek = upcomingAppts.filter(a => {
-    const diffDays = (new Date(a.start_time) - now) / (1000 * 60 * 60 * 24);
-    return diffDays <= 7;
-  }).length;
-
-  const missingAddressCount = upcomingAppts.filter(a => !a.service_address).length;
-
-  function renderApptCard(a, options = {}) {
-    const startDate = new Date(a.start_time);
-    const dateStr = startDate.toISOString().split('T')[0];
-    let badge = '';
-    if (a.status === 'cancelled') {
-      badge = '';
-    } else if (dateStr === todayStr) {
-      badge = '<span class="day-badge today">TODAY</span>';
-    } else if (dateStr === tomorrowStr) {
-      badge = '<span class="day-badge tomorrow">TOMORROW</span>';
+    if (toolUseBlocks.length === 0) {
+      finalText = textBlocks.map(b => b.text).join(' ').trim();
+      break;
     }
 
-    return `
-    <div class="appt-row ${options.dimmed ? 'dimmed' : ''}">
-      <div class="appt-date-block ${a.status === 'cancelled' ? 'cancelled-block' : ''}">
-        <div class="appt-month">${startDate.toLocaleDateString('en-US', { month: 'short' }).toUpperCase()}</div>
-        <div class="appt-day">${startDate.getDate()}</div>
-      </div>
-      <div class="appt-main">
-        <div class="appt-name-line">
-          <span class="appt-name">${a.lead_name || 'Unknown'}</span>
-          <div style="display:flex;gap:6px;align-items:center;">
-            ${badge}
-            <span class="tag-lg status-${a.status}">${a.status === 'cancelled' ? 'Cancelled' : a.status}</span>
-          </div>
-        </div>
-        <div class="appt-detail">${startDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${startDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })} · ${a.phone}</div>
-        ${a.service_address
-          ? `<div class="appt-address">📍 ${a.service_address}</div>`
-          : a.status !== 'cancelled' ? '<div class="appt-address-missing">⚠️ Address not collected</div>' : ''}
-      </div>
-      <div class="appt-code">
-        <div class="code-label">CODE</div>
-        <div class="code-value">${a.confirmation_code || '-'}</div>
-      </div>
-    </div>
-  `;
-  }
+    messages.push({ role: 'assistant', content: response.content });
 
-  const upcomingCards = upcomingAppts.map(a => renderApptCard(a)).join('');
-  const pastCards = pastAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
-  const cancelledCards = cancelledAppts.map(a => renderApptCard(a, { dimmed: true })).join('');
+    const toolResults = [];
+    for (const toolUse of toolUseBlocks) {
+      const result = executeToolCall(toolUse.name, toolUse.input, { business, lead, From });
 
-  const allLeadsForJs = [...leads, ...deletedLeads];
-  const leadData = JSON.stringify(allLeadsForJs).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
-  const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
-
-  const trendBars = last7Days.map(d => `
-    <div class="trend-col">
-      <div class="trend-bar-wrap">
-        <div class="trend-bar" style="height:${(d.count / maxDayCount) * 100}%;${d.count === 0 ? 'min-height:0' : 'min-height:4px'}"></div>
-      </div>
-      <div class="trend-label">${d.label}</div>
-      <div class="trend-count">${d.count}</div>
-    </div>
-  `).join('');
-
-  return res.send(renderPage(business.name, `
-    ${backLink}
-    <h2>${business.name}</h2>
-    <div class="sub">${business.twilio_number} · ${business.timezone}</div>
-
-    <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
-      <button class="tab-btn" onclick="switchTab('leads', this)">Leads <span class="tab-count">${leads.length}</span></button>
-      <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${upcomingAppts.length}</span></button>
-      <button class="tab-btn" onclick="switchTab('deleted', this)">Deleted <span class="tab-count">${deletedLeads.length}</span></button>
-    </div>
-
-    <div id="tab-overview" class="tab-content active">
-      <div class="analytics-grid">
-        <div class="analytics-card">
-          <div class="analytics-label">Leads This Month</div>
-          <div class="analytics-value">${leadsThisMonth.length}</div>
-        </div>
-        <div class="analytics-card">
-          <div class="analytics-label">Appointments Booked</div>
-          <div class="analytics-value">${apptsThisMonth.length}</div>
-        </div>
-        <div class="analytics-card">
-          <div class="analytics-label">Conversion Rate</div>
-          <div class="analytics-value">${conversionRate}%</div>
-        </div>
-        <div class="analytics-card highlight">
-          <div class="analytics-label">Revenue Recovered (Month)</div>
-          <div class="analytics-value">$${revenueRecoveredMonth.toLocaleString()}</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">Leads — Last 7 Days</div>
-        <div class="trend-chart">
-          ${trendBars}
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">All-Time Summary</div>
-        <div class="summary-grid">
-          <div class="summary-item">
-            <div class="summary-label">Total Leads</div>
-            <div class="summary-value">${totalLeadsAllTime}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-label">Total Appointments</div>
-            <div class="summary-value">${totalApptsAllTime}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-label">Total Revenue Recovered</div>
-            <div class="summary-value" style="color:#16A34A">$${revenueRecoveredAllTime.toLocaleString()}</div>
-          </div>
-          <div class="summary-item">
-            <div class="summary-label">Avg Job Value</div>
-            <div class="summary-value">$${avgJobValue}</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">Lead Urgency Breakdown</div>
-        <div class="urgency-row">
-          <div class="urgency-item">
-            <div class="urgency-circle" style="background:#FEE2E2;color:#DC2626">${urgencyBreakdown.high}</div>
-            <div class="urgency-label">High</div>
-          </div>
-          <div class="urgency-item">
-            <div class="urgency-circle" style="background:#FEF3C7;color:#D97706">${urgencyBreakdown.medium}</div>
-            <div class="urgency-label">Medium</div>
-          </div>
-          <div class="urgency-item">
-            <div class="urgency-circle" style="background:#DCFCE7;color:#16A34A">${urgencyBreakdown.low}</div>
-            <div class="urgency-label">Low</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div id="tab-leads" class="tab-content">
-      <div class="legend">
-        <span class="legend-title">Legend:</span>
-        <span class="legend-group-label">Status</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#1A6FDB"></span>New</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#16A34A"></span>Scheduled</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#D97706"></span>Needs Follow-Up</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#64748B"></span>Closed</span>
-        <span class="legend-divider"></span>
-        <span class="legend-group-label">Urgency</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#DC2626"></span>High</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#F59E0B"></span>Medium</span>
-        <span class="legend-item"><span class="legend-dot" style="background:#16A34A"></span>Low</span>
-      </div>
-
-      <div class="select-bar">
-        <button class="select-toggle" id="leads-select-toggle" onclick="toggleSelectMode('leads')">Select</button>
-        <div class="select-actions" id="leads-select-actions">
-          <span class="select-count" id="leads-select-count">0 selected</span>
-          <button class="btn-danger" onclick="deleteSelected()">Delete selected</button>
-          <button class="btn-plain" onclick="toggleSelectMode('leads')">Cancel</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="lead-list" id="leads-list">
-          ${leads.length === 0 ? '<div class="empty">No leads yet</div>' : leadCards}
-        </div>
-      </div>
-    </div>
-
-    <div id="tab-appointments" class="tab-content">
-      <div class="appt-stats-strip">
-        <div class="appt-stat">
-          <div class="appt-stat-num">${upcomingAppts.length}</div>
-          <div class="appt-stat-label">Upcoming</div>
-        </div>
-        <div class="appt-stat">
-          <div class="appt-stat-num">${upcomingThisWeek}</div>
-          <div class="appt-stat-label">This Week</div>
-        </div>
-        <div class="appt-stat ${missingAddressCount > 0 ? 'warn' : ''}">
-          <div class="appt-stat-num">${missingAddressCount}</div>
-          <div class="appt-stat-label">Missing Address</div>
-        </div>
-        <div class="appt-stat">
-          <div class="appt-stat-num">$${(upcomingAppts.length * avgJobValue).toLocaleString()}</div>
-          <div class="appt-stat-label">Pipeline Value</div>
-        </div>
-      </div>
-
-      <div class="appt-subtabs">
-        <button class="appt-subtab-btn active" onclick="switchApptSubtab('upcoming', this)">Upcoming (${upcomingAppts.length})</button>
-        <button class="appt-subtab-btn" onclick="switchApptSubtab('past', this)">Past (${pastAppts.length})</button>
-        <button class="appt-subtab-btn" onclick="switchApptSubtab('cancelled', this)">Cancelled (${cancelledAppts.length})</button>
-      </div>
-
-      <div id="appt-sub-upcoming" class="appt-subtab-content active">
-        <div class="section">
-          ${upcomingAppts.length === 0 ? '<div class="empty">No upcoming appointments</div>' : `<div class="appt-list">${upcomingCards}</div>`}
-        </div>
-      </div>
-      <div id="appt-sub-past" class="appt-subtab-content">
-        <div class="section">
-          ${pastAppts.length === 0 ? '<div class="empty">No past appointments</div>' : `<div class="appt-list">${pastCards}</div>`}
-        </div>
-      </div>
-      <div id="appt-sub-cancelled" class="appt-subtab-content">
-        <div class="section">
-          ${cancelledAppts.length === 0 ? '<div class="empty">No cancelled appointments</div>' : `<div class="appt-list">${cancelledCards}</div>`}
-        </div>
-      </div>
-    </div>
-
-    <div id="tab-deleted" class="tab-content">
-      <div class="deleted-note">Deleted leads are kept for 30 days, then permanently erased. You can recover them anytime before then.</div>
-
-      <div class="select-bar">
-        <button class="select-toggle" id="deleted-select-toggle" onclick="toggleSelectMode('deleted')">Select</button>
-        <div class="select-actions" id="deleted-select-actions">
-          <span class="select-count" id="deleted-select-count">0 selected</span>
-          <button class="btn-recover" onclick="recoverSelected()">Recover selected</button>
-          <button class="btn-danger" onclick="permanentDeleteSelected()">Delete permanently</button>
-          <button class="btn-plain" onclick="toggleSelectMode('deleted')">Cancel</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="lead-list" id="deleted-list">
-          ${deletedLeads.length === 0 ? '<div class="empty">Nothing in the trash</div>' : deletedCards}
-        </div>
-      </div>
-    </div>
-
-    <div class="modal" id="modal">
-      <div class="modal-box">
-        <span class="modal-close" onclick="closeModal()">×</span>
-        <div class="modal-title" id="modal-title">Lead Details</div>
-        <div id="modal-content"></div>
-        <div id="modal-appointment"></div>
-      </div>
-    </div>
-
-    <script>
-      const leads = JSON.parse(\`${leadData}\`);
-      const selectMode = { leads: false, deleted: false };
-      let currentLeadId = null;
-
-      function switchTab(tabName, btn) {
-        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-        document.getElementById('tab-' + tabName).classList.add('active');
-        btn.classList.add('active');
+      if (toolUse.name === 'check_availability') {
+        verifiedFacts.lastCheckAvailabilityDate = toolUse.input.date;
+        verifiedFacts.lastCheckAvailabilityDateFormatted = result.date_formatted || result.next_available_date_formatted || null;
+        verifiedFacts.lastCheckHadRequestedAvailability = result.requested_date_had_availability === true;
       }
-
-      function switchApptSubtab(name, btn) {
-        document.querySelectorAll('.appt-subtab-content').forEach(el => el.classList.remove('active'));
-        document.querySelectorAll('.appt-subtab-btn').forEach(el => el.classList.remove('active'));
-        document.getElementById('appt-sub-' + name).classList.add('active');
-        btn.classList.add('active');
-      }
-
-      function toggleSelectMode(which) {
-        selectMode[which] = !selectMode[which];
-        const on = selectMode[which];
-        const listId = which === 'leads' ? 'leads-list' : 'deleted-list';
-        const list = document.getElementById(listId);
-        list.classList.toggle('select-mode', on);
-        document.getElementById(which + '-select-toggle').style.display = on ? 'none' : 'inline-block';
-        document.getElementById(which + '-select-actions').style.display = on ? 'flex' : 'none';
-        if (!on) {
-          list.querySelectorAll('.row-check').forEach(c => { c.checked = false; });
+      if (toolUse.name === 'book_appointment') {
+        if (result.success) {
+          verifiedFacts.bookedThisTurn = true;
+          verifiedFacts.confirmationCode = result.confirmation_code;
+          verifiedFacts.appointmentLabel = result.appointment_label;
+          verifiedFacts.addressCarriedOverThisTurn = !!result.address_carried_over;
+          verifiedFacts.nameCarriedOverThisTurn = !!result.name_carried_over;
         }
-        updateCount(which);
+      }
+      if (toolUse.name === 'save_customer_info') {
+        if (result.success) verifiedFacts.addressSavedThisTurn = true;
+        else verifiedFacts.addressSaveFailed = true;
+      }
+      if (toolUse.name === 'save_customer_name') {
+        if (result.success) verifiedFacts.nameSavedThisTurn = true;
+      }
+      if (toolUse.name === 'cancel_appointment') {
+        if (result.success) verifiedFacts.cancelledThisTurn = true;
+        else verifiedFacts.cancelFailed = true;
+      }
+      if (toolUse.name === 'mark_conversation_closed') {
+        verifiedFacts.closedThisTurn = true;
       }
 
-      function updateCount(which) {
-        const cls = which === 'leads' ? 'leads-check' : 'deleted-check';
-        const n = document.querySelectorAll('.' + cls + ':checked').length;
-        document.getElementById(which + '-select-count').textContent = n + ' selected';
-      }
-
-      function getChecked(cls) {
-        return Array.from(document.querySelectorAll('.' + cls + ':checked')).map(c => c.value);
-      }
-
-      document.addEventListener('change', function(e) {
-        if (e.target.classList.contains('leads-check')) updateCount('leads');
-        if (e.target.classList.contains('deleted-check')) updateCount('deleted');
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(result)
       });
+    }
 
-      async function deleteSelected() {
-        const ids = getChecked('leads-check');
-        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
-        const r = await fetch('/dashboard/api/leads/delete', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
-        });
-        const data = await r.json();
-        if (data.blocked && data.blocked.length > 0) {
-          alert(data.deleted + ' moved to trash. ' + data.blocked.length + ' could not be deleted because they have an upcoming appointment. Cancel the appointment first (open the lead to cancel it).');
+    messages.push({ role: 'user', content: toolResults });
+
+    if (response.stop_reason !== 'tool_use') {
+      finalText = textBlocks.map(b => b.text).join(' ').trim();
+      break;
+    }
+  }
+
+  if (!finalText) {
+    finalText = "Thanks for your patience! A team member will follow up with you shortly.";
+  }
+
+  // ===== GUARDRAIL VALIDATION LAYER =====
+  let guardrailTriggered = false;
+  const leadAlreadyScheduled = lead.status === 'scheduled';
+
+  // Establish the SINGLE SOURCE OF TRUTH for this customer's active booking.
+  // Prefer facts verified this turn; otherwise read them straight from the DB.
+  // This survives across turns (unlike verifiedFacts, which resets every message),
+  // so the code/date/time can be validated even on the final turn where the AI
+  // reveals them after collecting name and address on earlier turns.
+  const activeAppt = findActiveAppointmentForPhone(From);
+  const trueConfirmationCode =
+    verifiedFacts.confirmationCode || (activeAppt ? activeAppt.confirmation_code : null);
+  const trueAppointmentLabel =
+    verifiedFacts.appointmentLabel ||
+    (activeAppt ? labelFromStartTime(activeAppt.start_time) : null);
+
+  // 0. Validate AVAILABILITY CLAIMS match what was actually checked (pre-booking only)
+  if (!guardrailTriggered && verifiedFacts.lastCheckAvailabilityDateFormatted && !verifiedFacts.bookedThisTurn && verifiedFacts.lastCheckHadRequestedAvailability) {
+    const realDayMatch = verifiedFacts.lastCheckAvailabilityDateFormatted.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
+    if (realDayMatch) {
+      const realDay = realDayMatch[1];
+      const availabilityClaimPattern = new RegExp(`(?:available|have|open).{0,30}(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)(?!.{0,15}(?:isn'?t|is not|not available|unavailable))`, 'gi');
+      const matches = [...finalText.matchAll(availabilityClaimPattern)];
+      const hasMismatch = matches.some(m => m[1].toLowerCase() !== realDay.toLowerCase());
+      if (hasMismatch) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Availability day mismatch BEFORE booking.`);
+        updateLead(lead.id, { status: 'needs_followup' });
+        finalText = `Let me double check that for you - one moment. A team member will confirm available times shortly.`;
+        guardrailTriggered = true;
+      }
+    }
+  }
+
+  // 1. NEW booking confirmation claims without any verified/active booking
+  const claimsNewConfirmation = /your appointment is confirmed|you'?re booked in for|confirmation code\s*(?:is|:)/i.test(finalText);
+  if (!guardrailTriggered && claimsNewConfirmation && !verifiedFacts.bookedThisTurn && !leadAlreadyScheduled && !activeAppt) {
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed booking confirmation with no verified or active booking.`);
+    finalText = "Let me get that booked for you properly - one moment please.";
+    updateLead(lead.id, { status: 'needs_followup' });
+    guardrailTriggered = true;
+  }
+
+  // 2. SURGICAL FACT REPLACEMENT — the AI writes the natural sentence,
+  // but every confirmation code, time, and day it states is overwritten
+  // with the true value from the database before sending. The AI cannot
+  // emit a wrong code/time/day because it never gets the final say on them.
+  if (!guardrailTriggered) {
+    // 2a. Confirmation code
+    if (trueConfirmationCode) {
+      const codeRe = /(confirmation code\s*(?:is|:)?\s*#?)([a-z0-9\-]+)/i;
+      const codeMatch = codeRe.exec(finalText);
+      if (codeMatch) {
+        const statedCode = codeMatch[2].toUpperCase().replace(/-/g, '');
+        const realCode = trueConfirmationCode.toUpperCase().replace(/-/g, '');
+        if (statedCode !== realCode) {
+          console.error(`[GUARDRAIL] lead=${lead.id} code mismatch. Claude said "${codeMatch[2]}", real code is "${trueConfirmationCode}". Corrected.`);
+          finalText = finalText.replace(codeMatch[0], `${codeMatch[1]}${trueConfirmationCode}`);
+          guardrailTriggered = true;
         }
-        location.reload();
       }
-
-      async function recoverSelected() {
-        const ids = getChecked('deleted-check');
-        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
-        await fetch('/dashboard/api/leads/recover', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
-        });
-        location.reload();
+    } else {
+      // No verifiable code exists but the AI is stating one → fail safe.
+      const statesACode = /confirmation code\s*(?:is|:)/i.test(finalText);
+      if (statesACode) {
+        console.error(`[GUARDRAIL] lead=${lead.id} Message states a confirmation code but none could be verified. Holding message.`);
+        finalText = "You're all set! A team member will text your confirmation details shortly.";
+        updateLead(lead.id, { status: 'needs_followup' });
+        guardrailTriggered = true;
       }
+    }
 
-      async function permanentDeleteSelected() {
-        const ids = getChecked('deleted-check');
-        if (ids.length === 0) { alert('Select at least one lead first.'); return; }
-        const ok = confirm('Permanently erase ' + ids.length + ' lead' + (ids.length === 1 ? '' : 's') + '? This cannot be undone.');
-        if (!ok) return;
-        await fetch('/dashboard/api/leads/permanent-delete', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
-        });
-        location.reload();
-      }
+    // 2b. Time and 2c. Day — only correct once we have a real booking to compare to.
+    if (trueAppointmentLabel) {
+      const realTimeMatch = trueAppointmentLabel.match(/\d{1,2}:\d{2}\s*[AP]M/i);
+      const realDayMatch = trueAppointmentLabel.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i);
 
-      async function showLead(id) {
-        const lead = leads.find(l => l.id === id);
-        if (!lead) return;
-        currentLeadId = id;
-
-        let convoHtml = '';
-        try {
-          const convo = JSON.parse(lead.conversation || '[]')
-            .filter(m => m.role !== 'system');
-          convoHtml = convo.map(m => {
-            const cls = m.role === 'customer' ? 'customer' : 'assistant';
-            return '<div class="msg ' + cls + '"><div class="bubble">' + m.body + '</div></div>';
-          }).join('');
-        } catch(e) {}
-
-        document.getElementById('modal-title').textContent = lead.name || lead.phone;
-        document.getElementById('modal-content').innerHTML =
-          '<div class="field"><div class="field-label">Phone</div><div class="field-value">' + lead.phone + '</div></div>' +
-          '<div class="field"><div class="field-label">Urgency</div><div class="field-value">' + lead.urgency + '</div></div>' +
-          '<div class="field"><div class="field-label">Type</div><div class="field-value">' + lead.lead_type + '</div></div>' +
-          '<div class="field"><div class="field-label">AI Summary</div><div class="field-value">' + (lead.ai_summary || 'Not classified yet') + '</div></div>' +
-          '<div class="field"><div class="field-label">Conversation</div><div class="convo">' + (convoHtml || 'No messages yet') + '</div></div>';
-
-        // Load the appointment (if any) and show a Cancel button.
-        const apptBox = document.getElementById('modal-appointment');
-        apptBox.innerHTML = '<div class="appt-loading">Checking for appointments…</div>';
-        try {
-          const r = await fetch('/dashboard/api/leads/' + id + '/appointment');
-          const data = await r.json();
-          if (data.appointment) {
-            const a = data.appointment;
-            const start = new Date(a.start_time);
-            const when = start.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC' });
-            apptBox.innerHTML =
-              '<div class="appt-callout">' +
-                '<div class="appt-callout-label">Upcoming appointment</div>' +
-                '<div class="appt-callout-when">' + when + '</div>' +
-                (a.confirmation_code ? '<div class="appt-callout-code">Code: ' + a.confirmation_code + '</div>' : '') +
-                '<button class="btn-danger" style="margin-top:12px" onclick="cancelAppointment()">Cancel appointment</button>' +
-              '</div>';
-          } else {
-            apptBox.innerHTML = '';
+      // Replace any wrong time tokens with the real one.
+      if (realTimeMatch) {
+        const realTime = realTimeMatch[0].replace(/\s+/g, ' ').toUpperCase();
+        const realTimeNorm = realTime.replace(/\s/g, '');
+        finalText = finalText.replace(/\d{1,2}:\d{2}\s*[AP]M/gi, (tok) => {
+          if (tok.toUpperCase().replace(/\s/g, '') !== realTimeNorm) {
+            console.error(`[GUARDRAIL] lead=${lead.id} time mismatch. Claude said "${tok}", real time is "${realTime}". Corrected.`);
+            guardrailTriggered = true;
+            return realTime;
           }
-        } catch (e) {
-          apptBox.innerHTML = '';
-        }
-
-        document.getElementById('modal').classList.add('active');
-
-        const row = document.querySelector('[data-lead-id="' + id + '"]');
-        if (row && row.classList.contains('is-new')) {
-          row.classList.remove('is-new');
-          const dot = row.querySelector('.new-dot');
-          if (dot) dot.remove();
-          try {
-            await fetch('/dashboard/api/leads/' + id + '/view', { method: 'POST' });
-          } catch(e) {}
-        }
+          return tok;
+        });
       }
 
-      async function cancelAppointment() {
-        if (!currentLeadId) return;
-        const ok = confirm('Cancel this appointment? The customer will be texted to let them know.');
-        if (!ok) return;
-        const r = await fetch('/dashboard/api/leads/' + currentLeadId + '/cancel-appointment', { method: 'POST' });
-        const data = await r.json();
-        if (data.success) {
-          alert('Appointment cancelled and the customer was notified.');
-          location.reload();
-        } else {
-          alert('Could not cancel: ' + (data.reason || 'unknown error'));
-        }
+      // Replace any wrong weekday tokens with the real one.
+      if (realDayMatch) {
+        const realDay = realDayMatch[1];
+        finalText = finalText.replace(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi, (tok) => {
+          if (tok.toLowerCase() !== realDay.toLowerCase()) {
+            console.error(`[GUARDRAIL] lead=${lead.id} day mismatch. Claude said "${tok}", real day is "${realDay}". Corrected.`);
+            guardrailTriggered = true;
+            return realDay;
+          }
+          return tok;
+        });
       }
+    }
+  }
 
-      function closeModal() {
-        document.getElementById('modal').classList.remove('active');
-        currentLeadId = null;
-      }
+  // 3. Cancellation claims without verified cancellation
+  const claimsCancellation = /has been cancelled|cancelled your appointment|appointment is cancelled/i.test(finalText);
+  if (claimsCancellation && !verifiedFacts.cancelledThisTurn) {
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed cancellation with no verified tool result.`);
+    finalText = verifiedFacts.cancelFailed
+      ? "I couldn't find an active appointment to cancel under this number. A team member will follow up to confirm."
+      : "Let me process that cancellation - a team member will confirm shortly.";
+    updateLead(lead.id, { status: 'needs_followup' });
+    guardrailTriggered = true;
+  }
 
-      document.getElementById('modal').addEventListener('click', function(e) {
-        if (e.target === this) closeModal();
-      });
-    </script>
-  `, req.session.role));
-});
+  // 4. Address confirmation claims without verified save or carry-over
+  const claimsAddressSaved = /address on file|we have your address|address is saved/i.test(finalText);
+  if (claimsAddressSaved && !verifiedFacts.addressSavedThisTurn && !verifiedFacts.addressCarriedOverThisTurn && !leadAlreadyScheduled) {
+    console.error(`[GUARDRAIL] lead=${lead.id} Claude claimed address saved with no verified tool result.`);
+    updateLead(lead.id, { status: 'needs_followup' });
+    guardrailTriggered = true;
+  }
 
-function renderPage(title, content, role) {
-  return `<!DOCTYPE html>
-  <html>
-  <head>
-    <title>${title}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      * { box-sizing: border-box; margin: 0; padding: 0; }
-      :root {
-        --navy: #0D1B2A;
-        --blue: #1A6FDB;
-        --blue-light: #EBF3FF;
-        --sky: #4A9FFF;
-        --gray-50: #F8FAFC;
-        --gray-100: #F1F5F9;
-        --gray-300: #CBD5E1;
-        --gray-500: #64748B;
-        --gray-700: #334155;
-      }
-      body { font-family: -apple-system, sans-serif; background: var(--gray-50); color: var(--navy); }
-      .nav { background: var(--navy); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
-      .nav-title { font-size: 18px; font-weight: 800; color: white; letter-spacing: -0.5px; }
-      .nav-title span { color: var(--sky); }
-      .nav a { color: rgba(255,255,255,0.6); font-size: 14px; text-decoration: none; }
-      .nav a:hover { color: white; }
-      .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
-      .back { color: var(--gray-500); font-size: 14px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
-      .back:hover { color: var(--blue); }
-      h2 { font-size: 22px; margin-bottom: 4px; font-weight: 800; letter-spacing: -0.5px; }
-      .sub { color: var(--gray-500); font-size: 14px; margin-bottom: 24px; }
+  if (guardrailTriggered) {
+    console.error(`[GUARDRAIL_SUMMARY] lead=${lead.id} A guardrail was triggered this turn - flagged/corrected for review.`);
+  }
 
-      .biz-grid { display: grid; gap: 16px; }
-      .biz-card { background: white; border-radius: 12px; padding: 20px; text-decoration: none; color: inherit; display: block; border: 1px solid var(--gray-100); transition: box-shadow 0.2s, transform 0.2s; }
-      .biz-card:hover { box-shadow: 0 4px 24px rgba(13,27,42,0.08); transform: translateY(-2px); }
-      .biz-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
-      .biz-card-title { font-size: 16px; font-weight: 700; }
-      .biz-card-sub { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
-      .pill { font-size: 12px; padding: 4px 12px; border-radius: 100px; background: var(--blue-light); color: var(--blue); font-weight: 600; }
-      .biz-card-stats { display: flex; gap: 24px; }
-      .mini-stat { display: flex; flex-direction: column; }
-      .mini-stat-num { font-size: 22px; font-weight: 700; }
-      .mini-stat-label { font-size: 12px; color: var(--gray-500); margin-top: 2px; }
-
-      .empty { padding: 40px; text-align: center; color: var(--gray-500); font-size: 14px; }
-
-      .tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--gray-100); }
-      .tab-btn { background: none; border: none; padding: 12px 18px; font-size: 14px; font-weight: 600; color: var(--gray-500); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; display: flex; align-items: center; gap: 6px; }
-      .tab-btn:hover { color: var(--navy); }
-      .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
-      .tab-count { background: var(--gray-100); color: var(--gray-500); font-size: 11px; padding: 1px 7px; border-radius: 100px; font-weight: 700; }
-      .tab-btn.active .tab-count { background: var(--blue-light); color: var(--blue); }
-      .tab-content { display: none; }
-      .tab-content.active { display: block; }
-
-      .analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
-      .analytics-card { background: white; border-radius: 12px; border: 1px solid var(--gray-100); padding: 20px; }
-      .analytics-card.highlight { background: var(--navy); border-color: var(--navy); }
-      .analytics-card.highlight .analytics-label { color: rgba(255,255,255,0.6); }
-      .analytics-card.highlight .analytics-value { color: var(--sky); }
-      .analytics-label { font-size: 12px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; font-weight: 600; }
-      .analytics-value { font-size: 28px; font-weight: 800; color: var(--navy); letter-spacing: -0.5px; }
-
-      .section { background: white; border-radius: 12px; border: 1px solid var(--gray-100); margin-bottom: 24px; overflow: hidden; }
-      .section-header { padding: 16px 20px; border-bottom: 1px solid var(--gray-100); font-weight: 700; font-size: 15px; }
-
-      .trend-chart { padding: 24px; display: flex; gap: 8px; align-items: flex-end; }
-      .trend-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex: 1; }
-      .trend-bar-wrap { width: 100%; max-width: 32px; height: 100px; display: flex; align-items: flex-end; }
-      .trend-bar { width: 100%; background: linear-gradient(180deg, var(--sky), var(--blue)); border-radius: 6px 6px 0 0; transition: height 0.3s; }
-      .trend-label { font-size: 11px; color: var(--gray-500); }
-      .trend-count { font-size: 12px; color: var(--navy); font-weight: 700; }
-
-      .summary-grid { padding: 20px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
-      .summary-label { font-size: 12px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
-      .summary-value { font-size: 24px; font-weight: 800; color: var(--navy); margin-top: 4px; letter-spacing: -0.5px; }
-
-      .urgency-row { padding: 20px; display: flex; gap: 24px; }
-      .urgency-item { text-align: center; }
-      .urgency-circle { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 18px; margin: 0 auto; }
-      .urgency-label { font-size: 12px; color: var(--gray-500); margin-top: 8px; font-weight: 600; }
-
-      .legend { background: white; border: 1px solid var(--gray-100); border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 12px; color: var(--gray-700); }
-      .legend-title { font-weight: 700; color: var(--navy); }
-      .legend-group-label { font-weight: 700; color: var(--gray-500); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-      .legend-item { display: flex; align-items: center; gap: 6px; }
-      .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-      .legend-divider { width: 1px; height: 16px; background: var(--gray-100); margin: 0 4px; }
-
-      /* SELECT MODE */
-      .select-bar { display: flex; align-items: center; margin-bottom: 16px; min-height: 40px; }
-      .select-toggle { background: white; border: 1px solid var(--gray-300); color: var(--gray-700); padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-      .select-toggle:hover { border-color: var(--blue); color: var(--blue); }
-      .select-actions { display: none; align-items: center; gap: 10px; flex-wrap: wrap; }
-      .select-count { font-size: 13px; color: var(--gray-500); font-weight: 600; }
-      .btn-danger { background: #DC2626; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-      .btn-danger:hover { background: #B91C1C; }
-      .btn-recover { background: #16A34A; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-      .btn-recover:hover { background: #15803D; }
-      .btn-plain { background: none; border: none; color: var(--gray-500); padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
-      .btn-plain:hover { color: var(--navy); }
-      .row-check { display: none; width: 18px; height: 18px; margin: 16px 0 0 4px; flex-shrink: 0; cursor: pointer; }
-      .lead-list.select-mode .row-check { display: block; }
-      .lead-body { display: flex; align-items: flex-start; gap: 14px; flex: 1; min-width: 0; cursor: pointer; }
-
-      .deleted-note { background: var(--blue-light); border: 1px solid #CFE2FB; color: var(--gray-700); border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 16px; }
-
-      .appt-callout { background: var(--gray-50); border: 1px solid var(--gray-100); border-radius: 10px; padding: 16px; margin-top: 16px; }
-      .appt-callout-label { font-size: 11px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; margin-bottom: 6px; }
-      .appt-callout-when { font-size: 15px; font-weight: 700; color: var(--navy); }
-      .appt-callout-code { font-size: 13px; color: var(--gray-500); margin-top: 4px; font-family: monospace; }
-      .appt-loading { font-size: 13px; color: var(--gray-500); margin-top: 16px; }
-
-      .lead-list { display: flex; flex-direction: column; }
-      .lead-row { display: flex; align-items: flex-start; gap: 8px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); transition: background 0.15s; position: relative; }
-      .lead-row:last-child { border-bottom: none; }
-      .lead-row:hover { background: var(--gray-50); }
-      .lead-row.is-new { background: var(--blue-light); }
-      .lead-row.is-new:hover { background: #DCE9FC; }
-      .new-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); flex-shrink: 0; margin-top: 16px; }
-      .lead-avatar { width: 44px; height: 44px; border-radius: 50%; background: var(--navy); color: white; font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-      .lead-main { flex: 1; min-width: 0; }
-      .lead-name-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-      .lead-name { font-size: 16px; font-weight: 700; color: var(--navy); }
-      .lead-date { font-size: 12px; color: var(--gray-500); white-space: nowrap; }
-      .lead-phone { font-size: 13px; color: var(--gray-500); margin-top: 2px; }
-      .lead-summary { font-size: 14px; color: var(--gray-700); margin-top: 8px; line-height: 1.4; }
-      .lead-tags { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; flex-shrink: 0; }
-
-      .tag-lg { font-size: 13px; padding: 6px 14px; border-radius: 8px; font-weight: 700; text-transform: capitalize; white-space: nowrap; min-width: 80px; text-align: center; }
-      .urgency-high { background: #DC2626; color: white; }
-      .urgency-medium { background: #F59E0B; color: white; }
-      .urgency-low { background: #16A34A; color: white; }
-      .urgency-unknown { background: var(--gray-300); color: white; }
-      .status-new { background: var(--blue); color: white; }
-      .status-scheduled { background: #16A34A; color: white; }
-      .status-needs_followup { background: #D97706; color: white; }
-      .status-closed { background: var(--gray-500); color: white; }
-      .status-cancelled { background: #DC2626; color: white; }
-
-      /* APPT STATS STRIP */
-      .appt-stats-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-      .appt-stat { background: white; border: 1px solid var(--gray-100); border-radius: 10px; padding: 14px; text-align: center; }
-      .appt-stat.warn { border-color: #FDE68A; background: #FFFBEB; }
-      .appt-stat.warn .appt-stat-num { color: #D97706; }
-      .appt-stat-num { font-size: 22px; font-weight: 800; color: var(--navy); }
-      .appt-stat-label { font-size: 11px; color: var(--gray-500); margin-top: 2px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
-
-      /* APPT SUBTABS */
-      .appt-subtabs { display: flex; gap: 8px; margin-bottom: 16px; }
-      .appt-subtab-btn { background: white; border: 1px solid var(--gray-100); padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--gray-500); cursor: pointer; font-family: inherit; }
-      .appt-subtab-btn.active { background: var(--navy); color: white; border-color: var(--navy); }
-      .appt-subtab-content { display: none; }
-      .appt-subtab-content.active { display: block; }
-
-      .appt-list { display: flex; flex-direction: column; }
-      .appt-row { display: flex; align-items: center; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--gray-100); }
-      .appt-row:last-child { border-bottom: none; }
-      .appt-row.dimmed { opacity: 0.6; }
-      .appt-date-block { width: 56px; height: 56px; border-radius: 10px; background: var(--navy); color: white; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
-      .appt-date-block.cancelled-block { background: var(--gray-300); }
-      .appt-month { font-size: 10px; font-weight: 700; color: var(--sky); letter-spacing: 0.5px; }
-      .appt-date-block.cancelled-block .appt-month { color: white; }
-      .appt-day { font-size: 20px; font-weight: 800; line-height: 1; margin-top: 2px; }
-      .appt-main { flex: 1; min-width: 0; }
-      .appt-name-line { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
-      .appt-name { font-size: 16px; font-weight: 700; color: var(--navy); }
-      .appt-detail { font-size: 13px; color: var(--gray-500); margin-top: 4px; }
-      .appt-address { font-size: 13px; color: var(--gray-700); margin-top: 6px; }
-      .appt-address-missing { font-size: 13px; color: #D97706; margin-top: 6px; font-weight: 600; }
-      .appt-code { text-align: center; flex-shrink: 0; }
-      .code-label { font-size: 10px; color: var(--gray-300); font-weight: 700; letter-spacing: 0.5px; }
-      .code-value { font-size: 14px; font-weight: 800; color: var(--blue); font-family: monospace; margin-top: 2px; }
-      .day-badge { font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 100px; letter-spacing: 0.5px; }
-      .day-badge.today { background: #DC2626; color: white; }
-      .day-badge.tomorrow { background: #F59E0B; color: white; }
-
-      .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
-      .modal.active { display: flex; }
-      .modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 100%; max-height: 80vh; overflow-y: auto; }
-      .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 16px; color: var(--navy); }
-      .modal-close { cursor: pointer; color: var(--gray-300); font-size: 24px; line-height: 1; float: right; }
-      .convo { background: var(--gray-50); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; max-height: 300px; overflow-y: auto; }
-      .msg { margin-bottom: 8px; display: flex; }
-      .msg.customer { justify-content: flex-end; }
-      .msg.assistant { justify-content: flex-start; }
-      .bubble { display: inline-block; padding: 8px 12px; border-radius: 12px; max-width: 80%; word-break: break-word; }
-      .customer .bubble { background: var(--navy); color: white; border-radius: 12px 12px 2px 12px; }
-      .assistant .bubble { background: var(--gray-100); color: var(--navy); border-radius: 12px 12px 12px 2px; }
-      .field { margin-bottom: 12px; }
-      .field-label { font-size: 11px; color: var(--gray-300); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; font-weight: 700; }
-      .field-value { font-size: 14px; color: var(--navy); }
-
-      @media (max-width: 768px) {
-        .analytics-grid { grid-template-columns: repeat(2, 1fr); }
-        .summary-grid { grid-template-columns: 1fr; }
-        .lead-name-line { flex-direction: column; align-items: flex-start; gap: 2px; }
-        .lead-tags { flex-direction: row; }
-        .appt-stats-strip { grid-template-columns: repeat(2, 1fr); }
-        .appt-subtabs { flex-wrap: wrap; }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="nav">
-      <div class="nav-title">Missed<span>Pro</span></div>
-      <a href="/dashboard/logout">Sign out</a>
-    </div>
-    <div class="container">
-      ${content}
-    </div>
-  </body>
-  </html>`;
+  return finalText;
 }
 
-module.exports = router;
+module.exports = { classifyLead, runReceptionistConversation };
