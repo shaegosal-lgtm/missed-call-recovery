@@ -160,6 +160,7 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
 });
 
 router.post('/sms-reply', twilioAuth, async (req, res) => {
+  console.log('[SMS-WEBHOOK-FIELDS]', JSON.stringify(req.body));
   const { From, Body } = req.body;
   const text = Body.trim();
 
