@@ -93,6 +93,157 @@ router.post('/login', async (req, res) => {
 
   res.redirect('/dashboard/login?error=1');
 });
+// ===== ADMIN EDIT BUSINESS — change settings on an existing business =====
+router.get('/edit/:id', requireAdmin, (req, res) => {
+  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
+  if (!business) return res.redirect('/dashboard');
+  const hours = db.prepare('SELECT * FROM business_hours WHERE business_id = ?').all(req.params.id);
+  res.send(renderEditForm(business, hours));
+});
+
+router.post('/edit/:id', requireAdmin, (req, res) => {
+  const b = req.body;
+  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
+  if (!business) return res.redirect('/dashboard');
+
+  try {
+    if (!b.name || !b.ownerPhone) {
+      const hours = db.prepare('SELECT * FROM business_hours WHERE business_id = ?').all(req.params.id);
+      return res.send(renderEditForm(business, hours, 'Business name and owner phone are required.'));
+    }
+
+    const validPlan = ['starter', 'basic', 'pro'].includes(b.plan) ? b.plan : business.plan;
+
+    const dayNums = [0, 1, 2, 3, 4, 5, 6];
+    const hoursRows = [];
+    for (const d of dayNums) {
+      if (b[`day${d}`]) {
+        hoursRows.push({ day: d, open: b[`open${d}`] || '09:00', close: b[`close${d}`] || '17:00' });
+      }
+    }
+
+    const update = db.transaction(() => {
+      db.prepare(`
+        UPDATE businesses SET
+          name = ?, owner_phone = ?, owner_email = ?, business_phone = ?,
+          timezone = ?, appointment_duration_mins = ?, business_info = ?,
+          avg_job_value = ?, plan = ?
+        WHERE id = ?
+      `).run(
+        b.name, b.ownerPhone, b.ownerEmail || null, b.businessPhone || null,
+        b.timezone || 'America/Toronto', parseInt(b.durationMins) || 60,
+        b.businessInfo || null, parseFloat(b.avgJobValue) || 150, validPlan, req.params.id
+      );
+
+      db.prepare('DELETE FROM business_hours WHERE business_id = ?').run(req.params.id);
+      for (const h of hoursRows) {
+        db.prepare(`
+          INSERT INTO business_hours (id, business_id, day_of_week, open_time, close_time, is_open)
+          VALUES (?, ?, ?, ?, ?, 1)
+        `).run(uuidv4(), req.params.id, h.day, h.open, h.close);
+      }
+    });
+    update();
+
+    res.send(renderPage('Saved', `
+      <a href="/dashboard" class="back">← Back to dashboard</a>
+      <h2>✓ Changes Saved</h2>
+      <div class="setup-form" style="max-width:600px;">
+        <p style="font-size:15px;line-height:1.7;">
+          <strong>${b.name}</strong> updated. Plan: <strong>${validPlan.toUpperCase()}</strong>. Owner alerts go to <strong>${b.ownerPhone}</strong>.
+        </p>
+        <a href="/dashboard/business/${req.params.id}" class="setup-submit" style="display:block;text-align:center;text-decoration:none;margin-top:20px;">View Business</a>
+      </div>
+    `, 'admin'));
+  } catch (err) {
+    console.error('[edit] Failed to update business:', err.message || err);
+    const hours = db.prepare('SELECT * FROM business_hours WHERE business_id = ?').all(req.params.id);
+    res.send(renderEditForm(business, hours, 'Something went wrong: ' + (err.message || 'unknown error')));
+  }
+});
+
+function renderEditForm(business, hours, errorMsg) {
+  const hoursByDay = {};
+  for (const h of hours) hoursByDay[h.day_of_week] = h;
+
+  const dayNames = [
+    { n: 1, label: 'Monday' }, { n: 2, label: 'Tuesday' }, { n: 3, label: 'Wednesday' },
+    { n: 4, label: 'Thursday' }, { n: 5, label: 'Friday' }, { n: 6, label: 'Saturday' }, { n: 0, label: 'Sunday' },
+  ];
+  const dayRows = dayNames.map(d => {
+    const h = hoursByDay[d.n];
+    const checked = h ? 'checked' : '';
+    const open = h ? h.open_time : '09:00';
+    const close = h ? h.close_time : '17:00';
+    return `
+      <tr>
+        <td><label><input type="checkbox" name="day${d.n}" ${checked}> ${d.label}</label></td>
+        <td><input type="time" name="open${d.n}" value="${open}"></td>
+        <td><input type="time" name="close${d.n}" value="${close}"></td>
+      </tr>`;
+  }).join('');
+
+  const sel = (p) => business.plan === p ? 'selected' : '';
+
+  return renderPage('Edit Business', `
+    <a href="/dashboard" class="back">← Back to dashboard</a>
+    <h2>Edit ${business.name}</h2>
+    <div class="sub">Twilio number: ${business.twilio_number} (not editable here)</div>
+    ${errorMsg ? `<div class="setup-error">${errorMsg}</div>` : ''}
+    <form method="POST" action="/dashboard/edit/${business.id}" class="setup-form">
+      <div class="setup-section">Business</div>
+      <label>Business name *</label>
+      <input name="name" value="${(business.name || '').replace(/"/g, '&quot;')}" required>
+      <label>Forwarding line</label>
+      <input name="businessPhone" value="${business.business_phone || ''}">
+      <label>Plan *</label>
+      <select name="plan">
+        <option value="starter" ${sel('starter')}>Starter — $47/mo</option>
+        <option value="basic" ${sel('basic')}>Basic — $97/mo</option>
+        <option value="pro" ${sel('pro')}>Pro — $147/mo</option>
+      </select>
+      <label>Business info</label>
+      <textarea name="businessInfo" rows="5">${business.business_info || ''}</textarea>
+      <label>Average job value</label>
+      <input name="avgJobValue" type="number" value="${business.avg_job_value || 150}">
+      <label>Appointment duration (minutes)</label>
+      <input name="durationMins" type="number" value="${business.appointment_duration_mins || 60}">
+      <label>Timezone</label>
+      <input name="timezone" value="${business.timezone || 'America/Toronto'}">
+
+      <div class="setup-section">Owner alerts</div>
+      <label>Owner phone * (where booking SMS alerts go — must NOT be the Twilio number)</label>
+      <input name="ownerPhone" value="${business.owner_phone || ''}" required>
+      <label>Owner email</label>
+      <input name="ownerEmail" type="email" value="${business.owner_email || ''}">
+
+      <div class="setup-section">Business hours</div>
+      <table class="hours-table">
+        <tr><th>Open?</th><th>Open time</th><th>Close time</th></tr>
+        ${dayRows}
+      </table>
+
+      <button type="submit" class="setup-submit">Save Changes</button>
+    </form>
+
+    <style>
+      .setup-form { background: white; border: 1px solid var(--gray-100); border-radius: 12px; padding: 24px; max-width: 600px; }
+      .setup-form label { display: block; font-size: 13px; font-weight: 600; color: var(--gray-700); margin: 16px 0 6px; }
+      .setup-form input, .setup-form select, .setup-form textarea { width: 100%; padding: 10px 12px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 14px; font-family: inherit; }
+      .setup-section { font-size: 15px; font-weight: 800; color: var(--navy); margin: 28px 0 4px; padding-bottom: 6px; border-bottom: 2px solid var(--blue-light); }
+      .setup-section:first-child { margin-top: 0; }
+      .hours-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      .hours-table th { text-align: left; font-size: 12px; color: var(--gray-500); padding: 6px; }
+      .hours-table td { padding: 6px; }
+      .hours-table input[type="time"] { width: auto; }
+      .hours-table label { margin: 0; font-weight: 500; }
+      .setup-submit { margin-top: 28px; width: 100%; padding: 14px; background: var(--blue); color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 700; cursor: pointer; }
+      .setup-submit:hover { background: #1560C0; }
+      .setup-error { background: #fff5f5; color: #c53030; border: 1px solid #feb2b2; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
+    </style>
+  `, 'admin');
+}
+// ===== END ADMIN EDIT BUSINESS =====
 // ===== ADMIN SETUP FORM — create a fully provisioned business in one go =====
 const { v4: uuidv4 } = require('uuid');
 
@@ -373,19 +524,22 @@ router.get('/', requireAuth, (req, res) => {
       `).get(b.id).count;
 
       return `
-        <a href="/dashboard/business/${b.id}" class="biz-card">
-          <div class="biz-card-header">
-            <div>
-              <div class="biz-card-title">${b.name}</div>
-              <div class="biz-card-sub">${b.twilio_number}</div>
+        <div class="biz-card">
+          <a href="/dashboard/business/${b.id}" style="text-decoration:none;color:inherit;">
+            <div class="biz-card-header">
+              <div>
+                <div class="biz-card-title">${b.name}</div>
+                <div class="biz-card-sub">${b.twilio_number}</div>
+              </div>
+              <div class="pill">${(b.plan || 'basic').toUpperCase()}</div>
             </div>
-            <div class="pill">${leadCount} leads</div>
-          </div>
-          <div class="biz-card-stats">
-            <div class="mini-stat"><span class="mini-stat-num">${leadCount}</span><span class="mini-stat-label">Total Leads</span></div>
-            <div class="mini-stat"><span class="mini-stat-num">${apptCount}</span><span class="mini-stat-label">Upcoming Appts</span></div>
-          </div>
-        </a>
+            <div class="biz-card-stats">
+              <div class="mini-stat"><span class="mini-stat-num">${leadCount}</span><span class="mini-stat-label">Total Leads</span></div>
+              <div class="mini-stat"><span class="mini-stat-num">${apptCount}</span><span class="mini-stat-label">Upcoming Appts</span></div>
+            </div>
+          </a>
+          <a href="/dashboard/edit/${b.id}" style="display:inline-block;margin-top:12px;font-size:13px;font-weight:600;color:var(--blue);text-decoration:none;">Edit settings →</a>
+        </div>
       `;
     }).join('');
 
