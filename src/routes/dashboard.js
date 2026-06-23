@@ -93,7 +93,179 @@ router.post('/login', async (req, res) => {
 
   res.redirect('/dashboard/login?error=1');
 });
+// ===== ADMIN SETUP FORM — create a fully provisioned business in one go =====
+const { v4: uuidv4 } = require('uuid');
 
+router.get('/setup', requireAdmin, (req, res) => {
+  res.send(renderSetupForm());
+});
+
+router.post('/setup', requireAdmin, async (req, res) => {
+  const b = req.body;
+  try {
+    if (!b.name || !b.twilioNumber || !b.ownerPhone || !b.username || !b.password) {
+      return res.send(renderSetupForm('Missing required fields. Business name, Twilio number, owner phone, username, and password are all required.'));
+    }
+
+    // No duplicate Twilio number
+    const dupBiz = db.prepare('SELECT id FROM businesses WHERE twilio_number = ?').get(b.twilioNumber);
+    if (dupBiz) return res.send(renderSetupForm('A business with that Twilio number already exists.'));
+
+    // No duplicate username
+    const dupUser = db.prepare('SELECT id FROM users WHERE username = ?').get(b.username);
+    if (dupUser) return res.send(renderSetupForm('That username is already taken. Pick another.'));
+
+    const validPlan = ['starter', 'basic', 'pro'].includes(b.plan) ? b.plan : 'basic';
+    const businessId = uuidv4();
+    const passwordHash = await bcrypt.hash(b.password, 10);
+
+    // Build per-day hours from the form. Each day has openX / closeX, and a checkbox dayX.
+    const dayNums = [0, 1, 2, 3, 4, 5, 6]; // Sun..Sat
+    const hoursRows = [];
+    for (const d of dayNums) {
+      if (b[`day${d}`]) {
+        hoursRows.push({
+          day: d,
+          open: b[`open${d}`] || '09:00',
+          close: b[`close${d}`] || '17:00',
+        });
+      }
+    }
+
+    const provision = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO businesses
+        (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info, avg_job_value, plan)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        businessId, b.name, b.ownerPhone, b.ownerEmail || null, b.twilioNumber,
+        b.businessPhone || null, b.timezone || 'America/Toronto',
+        parseInt(b.durationMins) || 60, b.businessInfo || null,
+        parseFloat(b.avgJobValue) || 150, validPlan
+      );
+
+      for (const h of hoursRows) {
+        db.prepare(`
+          INSERT INTO business_hours (id, business_id, day_of_week, open_time, close_time, is_open)
+          VALUES (?, ?, ?, ?, ?, 1)
+        `).run(uuidv4(), businessId, h.day, h.open, h.close);
+      }
+
+      db.prepare(`
+        INSERT INTO users (id, business_id, username, password_hash, role)
+        VALUES (?, ?, ?, ?, 'business')
+      `).run(uuidv4(), businessId, b.username, passwordHash);
+    });
+
+    provision();
+
+    res.send(renderSetupSuccess(b, validPlan, businessId));
+  } catch (err) {
+    console.error('[setup] Failed to provision business:', err.message || err);
+    res.send(renderSetupForm('Something went wrong: ' + (err.message || 'unknown error') + '. Nothing was created.'));
+  }
+});
+
+function renderSetupForm(errorMsg) {
+  const dayNames = [
+    { n: 1, label: 'Monday' }, { n: 2, label: 'Tuesday' }, { n: 3, label: 'Wednesday' },
+    { n: 4, label: 'Thursday' }, { n: 5, label: 'Friday' }, { n: 6, label: 'Saturday' }, { n: 0, label: 'Sunday' },
+  ];
+  const dayRows = dayNames.map(d => `
+    <tr>
+      <td><label><input type="checkbox" name="day${d.n}" ${[1,2,3,4,5].includes(d.n) ? 'checked' : ''}> ${d.label}</label></td>
+      <td><input type="time" name="open${d.n}" value="09:00"></td>
+      <td><input type="time" name="close${d.n}" value="17:00"></td>
+    </tr>
+  `).join('');
+
+  return renderPage('Set Up New Business', `
+    <a href="/dashboard" class="back">← Back to dashboard</a>
+    <h2>Set Up New Business</h2>
+    <div class="sub">Fill in the client's details and click Create. This provisions everything at once.</div>
+    ${errorMsg ? `<div class="setup-error">${errorMsg}</div>` : ''}
+    <form method="POST" action="/dashboard/setup" class="setup-form">
+      <div class="setup-section">Business</div>
+      <label>Business name *</label>
+      <input name="name" required>
+      <label>Twilio number * (the number you bought & pointed at the app, e.g. +16475551234)</label>
+      <input name="twilioNumber" placeholder="+1..." required>
+      <label>Forwarding line (the client's real business phone calls ring to first — optional)</label>
+      <input name="businessPhone" placeholder="+1...">
+      <label>Plan *</label>
+      <select name="plan">
+        <option value="starter">Starter — $47/mo</option>
+        <option value="basic" selected>Basic — $97/mo</option>
+        <option value="pro">Pro — $147/mo</option>
+      </select>
+      <label>Business info (services, pricing, policies — the AI uses this to answer questions)</label>
+      <textarea name="businessInfo" rows="5" placeholder="e.g. We're a plumbing company. We do repairs, installs, and emergencies. Service call is $89..."></textarea>
+      <label>Average job value (for revenue tracking)</label>
+      <input name="avgJobValue" type="number" value="150">
+      <label>Appointment duration (minutes)</label>
+      <input name="durationMins" type="number" value="60">
+      <label>Timezone</label>
+      <input name="timezone" value="America/Toronto">
+
+      <div class="setup-section">Owner alerts</div>
+      <label>Owner phone * (where booking SMS alerts go — the CLIENT'S real phone, not the Twilio number)</label>
+      <input name="ownerPhone" placeholder="+1..." required>
+      <label>Owner email (for email alerts on Basic/Pro)</label>
+      <input name="ownerEmail" type="email" placeholder="owner@business.com">
+
+      <div class="setup-section">Business hours</div>
+      <table class="hours-table">
+        <tr><th>Open?</th><th>Open time</th><th>Close time</th></tr>
+        ${dayRows}
+      </table>
+
+      <div class="setup-section">Client dashboard login</div>
+      <label>Username *</label>
+      <input name="username" required autocomplete="off">
+      <label>Password *</label>
+      <input name="password" required autocomplete="off">
+
+      <button type="submit" class="setup-submit">Create Business</button>
+    </form>
+
+    <style>
+      .setup-form { background: white; border: 1px solid var(--gray-100); border-radius: 12px; padding: 24px; max-width: 600px; }
+      .setup-form label { display: block; font-size: 13px; font-weight: 600; color: var(--gray-700); margin: 16px 0 6px; }
+      .setup-form input, .setup-form select, .setup-form textarea { width: 100%; padding: 10px 12px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 14px; font-family: inherit; }
+      .setup-section { font-size: 15px; font-weight: 800; color: var(--navy); margin: 28px 0 4px; padding-bottom: 6px; border-bottom: 2px solid var(--blue-light); }
+      .setup-section:first-child { margin-top: 0; }
+      .hours-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      .hours-table th { text-align: left; font-size: 12px; color: var(--gray-500); padding: 6px; }
+      .hours-table td { padding: 6px; }
+      .hours-table input[type="time"] { width: auto; }
+      .hours-table label { margin: 0; font-weight: 500; }
+      .setup-submit { margin-top: 28px; width: 100%; padding: 14px; background: var(--blue); color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 700; cursor: pointer; }
+      .setup-submit:hover { background: #1560C0; }
+      .setup-error { background: #fff5f5; color: #c53030; border: 1px solid #feb2b2; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
+    </style>
+  `, 'admin');
+}
+
+function renderSetupSuccess(b, plan, businessId) {
+  return renderPage('Business Created', `
+    <a href="/dashboard" class="back">← Back to dashboard</a>
+    <h2>✓ Business Created</h2>
+    <div class="setup-form" style="max-width:600px;">
+      <p style="font-size:15px;line-height:1.7;">
+        <strong>${b.name}</strong> is set up on the <strong>${plan.toUpperCase()}</strong> plan.<br><br>
+        <strong>Twilio number:</strong> ${b.twilioNumber}<br>
+        <strong>Owner alerts go to:</strong> ${b.ownerPhone}<br>
+        <strong>Client login:</strong> ${b.username}<br><br>
+        Give the client their login (username + the password you set). They sign in at this site to see their dashboard.
+      </p>
+      <p style="margin-top:20px;background:var(--blue-light);padding:14px 16px;border-radius:8px;font-size:14px;line-height:1.6;">
+        <strong>Don't forget the Twilio setup:</strong> point ${b.twilioNumber}'s Voice and Messaging webhooks at this app, disable voicemail on the forwarding line, and tell the client to let calls ring (not decline).
+      </p>
+      <a href="/dashboard/setup" class="setup-submit" style="display:block;text-align:center;text-decoration:none;margin-top:20px;">Set Up Another</a>
+    </div>
+  `, 'admin');
+}
+// ===== END ADMIN SETUP FORM =====
 router.get('/logout', (req, res) => {
   req.session.destroy();
   res.redirect('/dashboard/login');
@@ -218,6 +390,7 @@ router.get('/', requireAuth, (req, res) => {
     }).join('');
 
     return res.send(renderPage('Admin Dashboard', `
+      <a href="/dashboard/setup" class="setup-submit" style="display:inline-block;width:auto;padding:10px 20px;text-decoration:none;margin-bottom:20px;background:var(--blue);color:white;border-radius:8px;font-weight:700;font-size:14px;">+ Set Up New Business</a>
       <h2>Businesses</h2>
       ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : `<div class="biz-grid">${businessCards}</div>`}
     `, 'admin'));

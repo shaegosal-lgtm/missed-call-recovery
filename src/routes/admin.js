@@ -16,7 +16,7 @@ function adminAuth(req, res, next) {
 router.post('/businesses', adminAuth, (req, res) => {
   const {
     name, ownerPhone, ownerEmail, twilioNumber, businessPhone,
-    timezone, durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue
+    timezone, durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue, plan
   } = req.body;
 
   if (!name || !ownerPhone || !twilioNumber) {
@@ -30,12 +30,13 @@ router.post('/businesses', adminAuth, (req, res) => {
     }
 
     const id = uuidv4();
+    const validPlan = ['starter', 'basic', 'pro'].includes(plan) ? plan : 'basic';
     db.prepare(`
       INSERT INTO businesses 
-      (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info, avg_job_value)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, name, owner_phone, owner_email, twilio_number, business_phone, timezone, appointment_duration_mins, business_info, avg_job_value, plan)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, name, ownerPhone, ownerEmail || null, twilioNumber, businessPhone || null,
-      timezone || 'America/Toronto', durationMins || 60, businessInfo || null, avgJobValue || 150);
+      timezone || 'America/Toronto', durationMins || 60, businessInfo || null, avgJobValue || 150, validPlan);
 
     const days = workDays || [1, 2, 3, 4, 5];
     const open = openTime || '09:00';
@@ -71,11 +72,13 @@ router.get('/businesses/:id', adminAuth, (req, res) => {
 router.patch('/businesses/:id', adminAuth, (req, res) => {
   const {
     name, ownerPhone, ownerEmail, businessPhone, timezone,
-    durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue
+    durationMins, businessInfo, openTime, closeTime, workDays, avgJobValue, plan
   } = req.body;
 
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
   if (!business) return res.status(404).json({ error: 'Not found' });
+
+  const validPlan = plan && ['starter', 'basic', 'pro'].includes(plan) ? plan : null;
 
   db.prepare(`
     UPDATE businesses SET
@@ -86,9 +89,10 @@ router.patch('/businesses/:id', adminAuth, (req, res) => {
       timezone = COALESCE(?, timezone),
       appointment_duration_mins = COALESCE(?, appointment_duration_mins),
       business_info = COALESCE(?, business_info),
-      avg_job_value = COALESCE(?, avg_job_value)
+      avg_job_value = COALESCE(?, avg_job_value),
+      plan = COALESCE(?, plan)
     WHERE id = ?
-  `).run(name, ownerPhone, ownerEmail, businessPhone, timezone, durationMins, businessInfo, avgJobValue, req.params.id);
+  `).run(name, ownerPhone, ownerEmail, businessPhone, timezone, durationMins, businessInfo, avgJobValue, validPlan, req.params.id);
 
   if (openTime || closeTime || workDays) {
     db.prepare('DELETE FROM business_hours WHERE business_id = ?').run(req.params.id);
@@ -180,6 +184,7 @@ router.get('/businesses/:id/appointments', adminAuth, (req, res) => {
   `).all(req.params.id);
   res.json(appointments);
 });
+
 // Clear all leads, calls, and appointments for a business (testing utility)
 router.delete('/businesses/:id/test-data', adminAuth, (req, res) => {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
@@ -215,4 +220,5 @@ router.delete('/businesses/:id/test-data', adminAuth, (req, res) => {
     callsDeleted: callsResult.changes
   });
 });
+
 module.exports = router;
