@@ -10,7 +10,7 @@ const {
   cancelLeadAppointment,
 } = require('../services/leadService');
 const { sendSMS } = require('../services/twilioService');
-
+const { planAllows } = require('../config/plans');
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
   res.redirect('/dashboard/login');
@@ -234,6 +234,9 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
   if (!business) return res.redirect('/dashboard');
 
+  // Pro-only: analytics & revenue tracking. Lower plans see a simpler Overview.
+  const showAnalytics = planAllows(business.plan, 'analytics');
+
   // LIVE leads (not trashed)
   const leads = db.prepare(`
     SELECT * FROM leads WHERE deleted_at IS NULL AND call_id IN (
@@ -432,6 +435,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
     </div>
 
     <div id="tab-overview" class="tab-content active">
+      ${showAnalytics ? `
       <div class="analytics-grid">
         <div class="analytics-card">
           <div class="analytics-label">Leads This Month</div>
@@ -497,8 +501,32 @@ router.get('/business/:id', requireAuth, (req, res) => {
           </div>
         </div>
       </div>
+      ` : `
+      <div class="analytics-grid">
+        <div class="analytics-card">
+          <div class="analytics-label">Leads This Month</div>
+          <div class="analytics-value">${leadsThisMonth.length}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-label">Appointments Booked</div>
+          <div class="analytics-value">${apptsThisMonth.length}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-label">Total Leads</div>
+          <div class="analytics-value">${totalLeadsAllTime}</div>
+        </div>
+        <div class="analytics-card">
+          <div class="analytics-label">Total Appointments</div>
+          <div class="analytics-value">${totalApptsAllTime}</div>
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-header" style="border-bottom:none;color:var(--gray-500);font-weight:600;">
+          Revenue tracking & detailed analytics are available on the Pro plan.
+        </div>
+      </div>
+      `}
     </div>
-
     <div id="tab-leads" class="tab-content">
       <div class="legend">
         <span class="legend-title">Legend:</span>

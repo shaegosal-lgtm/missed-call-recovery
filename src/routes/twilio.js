@@ -7,6 +7,7 @@ const { classifyLead, runReceptionistConversation } = require('../services/claud
 const { createLead, getLeadByPhone, updateLead, appendToConversation } = require('../services/leadService');
 const { notifyOwner } = require('../services/notifyService');
 const { sendLeadNotification } = require('../services/emailService');
+const { planAllows } = require('../config/plans');
 const twilioAuth = require('../middleware/twilioAuth');
 
 // Find the business for an incoming call/text by the number it came in TO.
@@ -66,19 +67,28 @@ async function runClassificationSafely(From, lead, business) {
   }
 }
 
-// Sends the new-lead email EXACTLY ONCE per lead, guarded by the notified flag.
-async function sendNewLeadEmailOnce(From, lead, business) {
+// Sends the new-lead notification EXACTLY ONCE per lead, guarded by the notified flag.
+// SMS owner-alert goes to ALL plans. The EMAIL is gated to plans that include it (Basic/Pro).
+async function sendNewLeadNotificationOnce(From, lead, business) {
   try {
     const fresh = db.prepare('SELECT * FROM leads WHERE id = ?').get(lead.id);
     if (!fresh || fresh.notified) return;
 
     updateLead(lead.id, { notified: 1 });
 
+    // SMS owner alert — every tier (Starter is "SMS only").
     await safeNotifyOwner(fresh);
-    await safeSendLeadNotification(business || { name: 'the business' }, fresh);
-    console.log(`New-lead email sent for ${From} (lead ${lead.id})`);
+
+    // Email alert — only plans that include email notifications (Basic/Pro).
+    const plan = business ? business.plan : null;
+    if (plan && planAllows(plan, 'emailNotifications')) {
+      await safeSendLeadNotification(business || { name: 'the business' }, fresh);
+      console.log(`New-lead SMS + email sent for ${From} (lead ${lead.id}, plan ${plan})`);
+    } else {
+      console.log(`New-lead SMS sent for ${From} (lead ${lead.id}); email skipped (plan ${plan || 'unknown'})`);
+    }
   } catch (err) {
-    console.error('[sendNewLeadEmailOnce] Failed:', err.message || err);
+    console.error('[sendNewLeadNotificationOnce] Failed:', err.message || err);
   }
 }
 
@@ -215,7 +225,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     updateLead(lead.id, { status: 'needs_followup' });
     if (isFirstSubstantiveReply) {
       await runClassificationSafely(From, lead, business);
-      await sendNewLeadEmailOnce(From, lead, business);
+      await sendNewLeadNotificationOnce(From, lead, business);
     }
     return res.status(200).send('<Response></Response>');
   }
@@ -238,7 +248,7 @@ router.post('/sms-reply', twilioAuth, async (req, res) => {
     }
 
     if (isFirstSubstantiveReply) {
-      await sendNewLeadEmailOnce(From, lead, business);
+      await sendNewLeadNotificationOnce(From, lead, business);
     }
   } catch (err) {
     console.error('[sms-reply] Receptionist conversation failed:', err.message || err);
