@@ -93,6 +93,32 @@ router.post('/login', async (req, res) => {
 
   res.redirect('/dashboard/login?error=1');
 });
+// ===== ADMIN DELETE BUSINESS — removes business record, hours, and logins =====
+// Leaves leads/calls/appointments in place (deliberate choice — may orphan data).
+router.post('/delete-business/:id', requireAdmin, (req, res) => {
+  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
+  if (!business) return res.json({ success: false, reason: 'not_found' });
+
+  // Require the typed name to match exactly, as a safety check.
+  if (!req.body || req.body.confirmName !== business.name) {
+    return res.json({ success: false, reason: 'name_mismatch' });
+  }
+
+  try {
+    const removeBusiness = db.transaction(() => {
+      db.prepare('DELETE FROM business_hours WHERE business_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM users WHERE business_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM businesses WHERE id = ?').run(req.params.id);
+    });
+    removeBusiness();
+    console.log(`[delete-business] Business ${req.params.id} (${business.name}) deleted by admin.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[delete-business] Failed:', err.message || err);
+    res.json({ success: false, reason: err.message || 'unknown' });
+  }
+});
+// ===== END ADMIN DELETE BUSINESS =====
 // ===== ADMIN EDIT BUSINESS — change settings on an existing business =====
 router.get('/edit/:id', requireAdmin, (req, res) => {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
