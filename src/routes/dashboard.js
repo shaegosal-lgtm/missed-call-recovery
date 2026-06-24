@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const db = require('../db/db');
 const {
   deleteLead,
@@ -11,6 +12,7 @@ const {
 } = require('../services/leadService');
 const { sendSMS } = require('../services/twilioService');
 const { planAllows } = require('../config/plans');
+
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
   res.redirect('/dashboard/login');
@@ -93,6 +95,7 @@ router.post('/login', async (req, res) => {
 
   res.redirect('/dashboard/login?error=1');
 });
+
 // ===== ADMIN DELETE BUSINESS — removes business record, hours, and logins =====
 // Leaves leads/calls/appointments in place (deliberate choice — may orphan data).
 router.post('/delete-business/:id', requireAdmin, (req, res) => {
@@ -119,6 +122,7 @@ router.post('/delete-business/:id', requireAdmin, (req, res) => {
   }
 });
 // ===== END ADMIN DELETE BUSINESS =====
+
 // ===== ADMIN EDIT BUSINESS — change settings on an existing business =====
 router.get('/edit/:id', requireAdmin, (req, res) => {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(req.params.id);
@@ -270,9 +274,8 @@ function renderEditForm(business, hours, errorMsg) {
   `, 'admin');
 }
 // ===== END ADMIN EDIT BUSINESS =====
-// ===== ADMIN SETUP FORM — create a fully provisioned business in one go =====
-const { v4: uuidv4 } = require('uuid');
 
+// ===== ADMIN SETUP FORM — create a fully provisioned business in one go =====
 router.get('/setup', requireAdmin, (req, res) => {
   res.send(renderSetupForm());
 });
@@ -443,6 +446,7 @@ function renderSetupSuccess(b, plan, businessId) {
   `, 'admin');
 }
 // ===== END ADMIN SETUP FORM =====
+
 router.get('/logout', (req, res) => {
   req.session.destroy();
   res.redirect('/dashboard/login');
@@ -593,6 +597,7 @@ router.get('/', requireAuth, (req, res) => {
         }
       </script>
     `, 'admin'));
+  }
 
   res.redirect(`/dashboard/business/${req.session.businessId}`);
 });
