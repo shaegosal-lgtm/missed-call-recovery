@@ -564,7 +564,10 @@ router.get('/', requireAuth, (req, res) => {
               <div class="mini-stat"><span class="mini-stat-num">${apptCount}</span><span class="mini-stat-label">Upcoming Appts</span></div>
             </div>
           </a>
-          <a href="/dashboard/edit/${b.id}" style="display:inline-block;margin-top:12px;font-size:13px;font-weight:600;color:var(--blue);text-decoration:none;">Edit settings →</a>
+          <div style="display:flex;gap:16px;align-items:center;margin-top:12px;">
+            <a href="/dashboard/edit/${b.id}" style="font-size:13px;font-weight:600;color:var(--blue);text-decoration:none;">Edit settings →</a>
+            <a href="#" onclick="deleteBusiness('${b.id}', '${(b.name || '').replace(/'/g, "\\'")}'); return false;" style="font-size:13px;font-weight:600;color:#DC2626;text-decoration:none;">Delete</a>
+          </div>
         </div>
       `;
     }).join('');
@@ -573,8 +576,23 @@ router.get('/', requireAuth, (req, res) => {
       <a href="/dashboard/setup" class="setup-submit" style="display:inline-block;width:auto;padding:10px 20px;text-decoration:none;margin-bottom:20px;background:var(--blue);color:white;border-radius:8px;font-weight:700;font-size:14px;">+ Set Up New Business</a>
       <h2>Businesses</h2>
       ${businesses.length === 0 ? '<div class="empty">No businesses yet.</div>' : `<div class="biz-grid">${businessCards}</div>`}
+      <script>
+        async function deleteBusiness(id, name) {
+          const typed = prompt('This permanently deletes the business, its hours, and its login. Its lead/appointment data will remain.\\n\\nTo confirm, type the business name exactly:\\n' + name);
+          if (typed === null) return;
+          if (typed !== name) { alert('Name did not match. Nothing was deleted.'); return; }
+          const r = await fetch('/dashboard/delete-business/' + id, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirmName: typed })
+          });
+          const data = await r.json();
+          if (data.success) { alert('Business deleted.'); location.reload(); }
+          else if (data.reason === 'name_mismatch') { alert('Name did not match. Nothing was deleted.'); }
+          else { alert('Could not delete: ' + (data.reason || 'unknown error')); }
+        }
+      </script>
     `, 'admin'));
-  }
 
   res.redirect(`/dashboard/business/${req.session.businessId}`);
 });
