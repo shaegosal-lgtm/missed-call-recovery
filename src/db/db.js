@@ -107,11 +107,9 @@ function ensureColumn(table, column, definition) {
   }
 }
 
-ensureColumn('leads', 'viewed', 'INTEGER DEFAULT 0');
-ensureColumn('leads', 'notified', 'INTEGER DEFAULT 0');
-ensureColumn('leads', 'deleted_at', 'DATETIME');
-ensureColumn('businesses', 'owner_email', 'TEXT');
-ensureColumn('businesses', 'avg_job_value', 'REAL DEFAULT 150');
-ensureColumn('businesses', 'plan', "TEXT DEFAULT 'basic'");
-
+ensureColumn('appointments', 'manual_title', 'TEXT');
+ensureColumn('appointments', 'manual_customer_name', 'TEXT');
+ensureColumn('appointments', 'manual_customer_phone', 'TEXT');
+ensureColumn('appointments', 'manual_address', 'TEXT');
+ensureColumn('appointments', 'is_manual', 'INTEGER DEFAULT 0');
 module.exports = db;

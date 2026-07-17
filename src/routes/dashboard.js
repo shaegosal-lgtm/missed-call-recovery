@@ -12,6 +12,7 @@ const {
 } = require('../services/leadService');
 const { sendSMS } = require('../services/twilioService');
 const { planAllows } = require('../config/plans');
+const calendarService = require('../services/calendarService');
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
@@ -788,6 +789,13 @@ router.get('/business/:id', requireAuth, (req, res) => {
   const leadData = JSON.stringify(allLeadsForJs).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
   const backLink = req.session.role === 'admin' ? '<a href="/dashboard" class="back">← All businesses</a>' : '';
 
+  // Calendar: current month's appointments (AI + manual) for the initial render.
+  const calNow = new Date();
+  const calInitYear = calNow.getUTCFullYear();
+  const calInitMonth = calNow.getUTCMonth() + 1; // 1-12
+  const calInitAppts = calendarService.getAppointmentsForMonth(business.id, calInitYear, calInitMonth);
+  const calData = JSON.stringify(calInitAppts).replace(/\\/g, '\\\\').replace(/`/g, '\\`');
+
   const trendBars = last7Days.map(d => `
     <div class="trend-col">
       <div class="trend-bar-wrap">
@@ -807,6 +815,7 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <button class="tab-btn active" onclick="switchTab('overview', this)">Overview</button>
       <button class="tab-btn" onclick="switchTab('leads', this)">Leads <span class="tab-count">${leads.length}</span></button>
       <button class="tab-btn" onclick="switchTab('appointments', this)">Appointments <span class="tab-count">${upcomingAppts.length}</span></button>
+      <button class="tab-btn" onclick="switchTab('calendar', this)">Calendar</button>
       <button class="tab-btn" onclick="switchTab('deleted', this)">Deleted <span class="tab-count">${deletedLeads.length}</span></button>
     </div>
 
@@ -973,6 +982,49 @@ router.get('/business/:id', requireAuth, (req, res) => {
       <div id="appt-sub-cancelled" class="appt-subtab-content">
         <div class="section">
           ${cancelledAppts.length === 0 ? '<div class="empty">No cancelled appointments</div>' : `<div class="appt-list">${cancelledCards}</div>`}
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-calendar" class="tab-content">
+      <div class="cal-header">
+        <button class="cal-nav" onclick="CAL.prevMonth()">‹</button>
+        <div class="cal-title" id="cal-title"></div>
+        <button class="cal-nav" onclick="CAL.nextMonth()">›</button>
+      </div>
+      <div class="cal-hint">Tap any day to add an appointment. Manual appointments block the AI from booking that time. Blue = AI booking, green = added by you.</div>
+      <div id="calendar-body"></div>
+    </div>
+
+    <div class="cal-modal" id="cal-modal">
+      <div class="cal-modal-box">
+        <span class="modal-close" onclick="CAL.closeModal()">×</span>
+        <div class="modal-title" id="cal-modal-title">Add Appointment</div>
+        <input type="hidden" id="cal-f-date">
+        <label class="cal-label">Time</label>
+        <div class="cal-time-row">
+          <select id="cal-f-hour" class="cal-input">
+            ${Array.from({length:24}, (_,h)=>`<option value="${h}">${((h%12)||12)}:00 ${h<12?'AM':'PM'}</option>`).join('')}
+          </select>
+          <select id="cal-f-minute" class="cal-input">
+            <option value="0">:00</option><option value="15">:15</option><option value="30">:30</option><option value="45">:45</option>
+          </select>
+        </div>
+        <label class="cal-label">Duration (minutes)</label>
+        <input id="cal-f-duration" class="cal-input" type="number" value="60">
+        <label class="cal-label">Title (e.g. "Smith - water heater")</label>
+        <input id="cal-f-title" class="cal-input" type="text">
+        <label class="cal-label">Customer name</label>
+        <input id="cal-f-name" class="cal-input" type="text">
+        <label class="cal-label">Customer phone</label>
+        <input id="cal-f-phone" class="cal-input" type="text">
+        <label class="cal-label">Address</label>
+        <input id="cal-f-address" class="cal-input" type="text">
+        <label class="cal-label">Notes</label>
+        <textarea id="cal-f-notes" class="cal-input" rows="2"></textarea>
+        <div class="cal-modal-actions">
+          <button class="btn-danger" id="cal-delete-btn" style="display:none" onclick="CAL.del()">Delete</button>
+          <button class="setup-submit" style="width:auto;padding:10px 24px;margin:0" onclick="CAL.save()">Save</button>
         </div>
       </div>
     </div>
@@ -1172,6 +1224,131 @@ router.get('/business/:id', requireAuth, (req, res) => {
       document.getElementById('modal').addEventListener('click', function(e) {
         if (e.target === this) closeModal();
       });
+
+      // ===== CALENDAR CLIENT =====
+      window.BUSINESS_ID = '${business.id}';
+      (function () {
+        const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+        const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+        let calYear, calMonth, calAppointments = [], editingApptId = null;
+
+        function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+        function fmtTime(iso){const d=new Date(iso);return d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true,timeZone:'UTC'});}
+        function apptLabel(a){ if(a.is_manual) return a.manual_title||a.manual_customer_name||'Appointment'; return a.lead_name||a.lead_phone||'Booking'; }
+        function apptsForDay(dateStr){ return calAppointments.filter(a=>(a.start_time||'').substring(0,10)===dateStr); }
+
+        async function loadMonth(year, month){
+          try{
+            const r=await fetch('/dashboard/api/business/'+window.BUSINESS_ID+'/calendar?year='+year+'&month='+month);
+            const data=await r.json();
+            calAppointments=data.appointments||[];
+          }catch(e){ calAppointments=[]; }
+          calYear=year; calMonth=month; render();
+        }
+        function prevMonth(){ let y=calYear,m=calMonth-1; if(m<1){m=12;y--;} loadMonth(y,m); }
+        function nextMonth(){ let y=calYear,m=calMonth+1; if(m>12){m=1;y++;} loadMonth(y,m); }
+
+        function render(){
+          const c=document.getElementById('calendar-body'); if(!c) return;
+          document.getElementById('cal-title').textContent=monthNames[calMonth-1]+' '+calYear;
+          const startWeekday=new Date(Date.UTC(calYear,calMonth-1,1)).getUTCDay();
+          const daysInMonth=new Date(Date.UTC(calYear,calMonth,0)).getUTCDate();
+          const todayStr=new Date().toISOString().substring(0,10);
+          let html='<div class="cal-grid">';
+          for(const dn of dayNames) html+='<div class="cal-dayname">'+dn+'</div>';
+          for(let i=0;i<startWeekday;i++) html+='<div class="cal-cell empty"></div>';
+          for(let day=1;day<=daysInMonth;day++){
+            const mm=String(calMonth).padStart(2,'0'), dd=String(day).padStart(2,'0');
+            const dateStr=calYear+'-'+mm+'-'+dd;
+            const dayAppts=apptsForDay(dateStr);
+            const isToday=dateStr===todayStr;
+            html+='<div class="cal-cell '+(isToday?'today':'')+'" onclick="CAL.openAdd(\\''+dateStr+'\\')">';
+            html+='<div class="cal-daynum">'+day+'</div>';
+            for(const a of dayAppts.slice(0,3)){
+              const cls=a.is_manual?'manual':'ai';
+              html+='<div class="cal-appt '+cls+'" onclick="event.stopPropagation(); CAL.openAppt(\\''+a.id+'\\')">'+fmtTime(a.start_time)+' '+esc(apptLabel(a))+'</div>';
+            }
+            if(dayAppts.length>3) html+='<div class="cal-more">+'+(dayAppts.length-3)+' more</div>';
+            html+='</div>';
+          }
+          html+='</div>';
+          c.innerHTML=html;
+        }
+
+        function openAdd(dateStr){
+          editingApptId=null;
+          document.getElementById('cal-modal-title').textContent='Add Appointment';
+          document.getElementById('cal-f-date').value=dateStr;
+          document.getElementById('cal-f-hour').value='9';
+          document.getElementById('cal-f-minute').value='0';
+          document.getElementById('cal-f-duration').value='60';
+          document.getElementById('cal-f-title').value='';
+          document.getElementById('cal-f-name').value='';
+          document.getElementById('cal-f-phone').value='';
+          document.getElementById('cal-f-address').value='';
+          document.getElementById('cal-f-notes').value='';
+          document.getElementById('cal-delete-btn').style.display='none';
+          document.getElementById('cal-modal').classList.add('open');
+        }
+        function openAppt(apptId){
+          const a=calAppointments.find(x=>x.id===apptId); if(!a) return;
+          if(!a.is_manual){ alert('This is a booking made by the AI receptionist. Manage it from the Leads or Appointments tab.'); return; }
+          editingApptId=apptId;
+          document.getElementById('cal-modal-title').textContent='Edit Appointment';
+          const d=new Date(a.start_time);
+          document.getElementById('cal-f-date').value=(a.start_time||'').substring(0,10);
+          document.getElementById('cal-f-hour').value=String(d.getUTCHours());
+          document.getElementById('cal-f-minute').value=String(d.getUTCMinutes());
+          const durMin=Math.round((new Date(a.end_time)-new Date(a.start_time))/60000);
+          document.getElementById('cal-f-duration').value=String(durMin||60);
+          document.getElementById('cal-f-title').value=a.manual_title||'';
+          document.getElementById('cal-f-name').value=a.manual_customer_name||'';
+          document.getElementById('cal-f-phone').value=a.manual_customer_phone||'';
+          document.getElementById('cal-f-address').value=a.manual_address||'';
+          document.getElementById('cal-f-notes').value=a.notes||'';
+          document.getElementById('cal-delete-btn').style.display='inline-block';
+          document.getElementById('cal-modal').classList.add('open');
+        }
+        function closeModal(){ document.getElementById('cal-modal').classList.remove('open'); editingApptId=null; }
+
+        async function save(){
+          const payload={
+            date:document.getElementById('cal-f-date').value,
+            hour:parseInt(document.getElementById('cal-f-hour').value),
+            minute:parseInt(document.getElementById('cal-f-minute').value),
+            durationMins:parseInt(document.getElementById('cal-f-duration').value),
+            title:document.getElementById('cal-f-title').value,
+            customerName:document.getElementById('cal-f-name').value,
+            customerPhone:document.getElementById('cal-f-phone').value,
+            address:document.getElementById('cal-f-address').value,
+            notes:document.getElementById('cal-f-notes').value,
+          };
+          const url=editingApptId
+            ? '/dashboard/api/business/'+window.BUSINESS_ID+'/calendar/edit/'+editingApptId
+            : '/dashboard/api/business/'+window.BUSINESS_ID+'/calendar/add';
+          const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+          const data=await r.json();
+          if(data.success){ closeModal(); loadMonth(calYear,calMonth); }
+          else if(data.error==='slot_taken'){ alert('That time overlaps an existing appointment. Pick a different time.'); }
+          else{ alert('Could not save: '+(data.error||'unknown error')); }
+        }
+        async function del(){
+          if(!editingApptId) return;
+          if(!confirm('Delete this appointment? This cannot be undone.')) return;
+          const r=await fetch('/dashboard/api/business/'+window.BUSINESS_ID+'/calendar/delete/'+editingApptId,{method:'POST'});
+          const data=await r.json();
+          if(data.success){ closeModal(); loadMonth(calYear,calMonth); }
+          else{ alert('Could not delete: '+(data.error||'unknown error')); }
+        }
+
+        window.CAL={ prevMonth, nextMonth, openAdd, openAppt, closeModal, save, del };
+
+        // Initialize with server-provided current month.
+        calYear=${calInitYear}; calMonth=${calInitMonth};
+        calAppointments=JSON.parse(\`${calData}\`);
+        render();
+        document.getElementById('cal-modal').addEventListener('click', function(e){ if(e.target===this) closeModal(); });
+      })();
     </script>
   `, req.session.role));
 });
@@ -1352,6 +1529,35 @@ function renderPage(title, content, role) {
       .day-badge.today { background: #DC2626; color: white; }
       .day-badge.tomorrow { background: #F59E0B; color: white; }
 
+      .cal-header { display: flex; align-items: center; justify-content: center; gap: 20px; margin-bottom: 8px; }
+      .cal-title { font-size: 18px; font-weight: 800; color: var(--navy); min-width: 180px; text-align: center; }
+      .cal-nav { background: white; border: 1px solid var(--gray-300); border-radius: 8px; width: 36px; height: 36px; font-size: 18px; cursor: pointer; color: var(--navy); font-weight: 700; }
+      .cal-nav:hover { border-color: var(--blue); color: var(--blue); }
+      .cal-hint { font-size: 12px; color: var(--gray-500); text-align: center; margin-bottom: 16px; }
+      .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+      .cal-dayname { font-size: 11px; font-weight: 700; color: var(--gray-500); text-align: center; padding: 6px 0; text-transform: uppercase; }
+      .cal-cell { background: white; border: 1px solid var(--gray-100); border-radius: 8px; min-height: 84px; padding: 6px; cursor: pointer; transition: border-color 0.15s; overflow: hidden; }
+      .cal-cell:hover { border-color: var(--blue); }
+      .cal-cell.empty { background: transparent; border: none; cursor: default; }
+      .cal-cell.today { border-color: var(--blue); background: var(--blue-light); }
+      .cal-daynum { font-size: 13px; font-weight: 700; color: var(--navy); margin-bottom: 4px; }
+      .cal-appt { font-size: 10px; padding: 2px 5px; border-radius: 4px; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: white; }
+      .cal-appt.ai { background: var(--blue); }
+      .cal-appt.manual { background: #16A34A; }
+      .cal-more { font-size: 10px; color: var(--gray-500); font-weight: 600; }
+      .cal-modal { display: none; position: fixed; inset: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
+      .cal-modal.open { display: flex; }
+      .cal-modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 460px; width: 100%; max-height: 85vh; overflow-y: auto; }
+      .cal-label { display: block; font-size: 12px; font-weight: 700; color: var(--gray-700); margin: 14px 0 5px; }
+      .cal-input { width: 100%; padding: 9px 12px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 14px; font-family: inherit; }
+      .cal-time-row { display: flex; gap: 10px; }
+      .cal-time-row .cal-input { width: auto; flex: 1; }
+      .cal-modal-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 22px; }
+      @media (max-width: 768px) {
+        .cal-cell { min-height: 60px; padding: 4px; }
+        .cal-appt { font-size: 8px; }
+      }
+
       .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,27,42,0.6); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
       .modal.active { display: flex; }
       .modal-box { background: white; border-radius: 12px; padding: 24px; max-width: 500px; width: 100%; max-height: 80vh; overflow-y: auto; }
@@ -1389,5 +1595,61 @@ function renderPage(title, content, role) {
   </body>
   </html>`;
 }
+
+// ===== CALENDAR ROUTES (manual appointments) =====
+router.get('/api/business/:id/calendar', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const year = parseInt(req.query.year);
+  const month = parseInt(req.query.month);
+  if (!year || !month) return res.status(400).json({ error: 'year and month required' });
+  const appts = calendarService.getAppointmentsForMonth(req.params.id, year, month);
+  res.json({ appointments: appts });
+});
+
+router.post('/api/business/:id/calendar/add', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const b = req.body;
+  if (!b.date || b.hour === undefined || b.minute === undefined) {
+    return res.json({ success: false, error: 'missing_time' });
+  }
+  const hh = String(b.hour).padStart(2, '0');
+  const mm = String(b.minute).padStart(2, '0');
+  const startTime = `${b.date}T${hh}:${mm}:00.000Z`;
+  const result = calendarService.createManualAppointment(req.params.id, {
+    startTime, durationMins: b.durationMins, title: b.title,
+    customerName: b.customerName, customerPhone: b.customerPhone,
+    address: b.address, notes: b.notes,
+  });
+  res.json(result);
+});
+
+router.post('/api/business/:id/calendar/edit/:apptId', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const b = req.body;
+  const hh = String(b.hour).padStart(2, '0');
+  const mm = String(b.minute).padStart(2, '0');
+  const startTime = `${b.date}T${hh}:${mm}:00.000Z`;
+  const result = calendarService.editManualAppointment(req.params.apptId, req.params.id, {
+    startTime, durationMins: b.durationMins, title: b.title,
+    customerName: b.customerName, customerPhone: b.customerPhone,
+    address: b.address, notes: b.notes,
+  });
+  res.json(result);
+});
+
+router.post('/api/business/:id/calendar/delete/:apptId', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const result = calendarService.deleteManualAppointment(req.params.apptId, req.params.id);
+  res.json(result);
+});
+// ===== END CALENDAR ROUTES =====
 
 module.exports = router;
