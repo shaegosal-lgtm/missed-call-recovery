@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db/db');
-const { sendSMS } = require('../services/twilioService');
+const { sendSMS, lookupLineType } = require('../services/twilioService');
 const { classifyLead, runReceptionistConversation } = require('../services/claudeService');
 const { createLead, getLeadByPhone, updateLead, appendToConversation } = require('../services/leadService');
 const { notifyOwner } = require('../services/notifyService');
@@ -46,6 +46,59 @@ async function safeSendLeadNotification(business, leadData, appointmentDetails) 
   } catch (err) {
     console.error('[safeSendLeadNotification] Failed, but continuing:', err.message || err);
   }
+}
+
+// Handles the text-back after a missed call, with landline detection.
+// If the caller is CONFIDENTLY a landline, we skip the (useless) text, mark the
+// lead "landline - needs callback", and alert the owner to call back manually.
+// Mobile / VoIP / unknown / failed lookups are texted normally (safer for real
+// customers than skipping a text over an uncertain result).
+async function handleMissedCallTextBack(From, callId, business, logTag) {
+  const bizName = business ? business.name : 'us';
+  const lineType = await lookupLineType(From);
+  console.log(`[${logTag}] Line type for ${From}: ${lineType}`);
+
+  if (lineType === 'landline') {
+    // Landline: texting won't reach them. Create the lead, flag it, alert the owner.
+    const leadId = createLead(From, callId);
+    const note = 'Landline — needs callback. This caller used a landline and cannot receive texts. Please call them back.';
+    updateLead(leadId, {
+      status: 'needs_followup',
+      reason: 'Landline caller — needs manual callback',
+      ai_summary: note,
+      lead_type: 'landline',
+      urgency: 'high',
+    });
+    appendToConversation(leadId, 'assistant', '[System] Caller is on a landline and cannot receive texts. Owner alerted to call back.');
+    console.log(`[${logTag}] Landline detected for ${From}. Skipped text, flagged for callback.`);
+
+    // Alert the owner to call back (reuses the normal owner-alert path).
+    try {
+      const fresh = db.prepare('SELECT * FROM leads WHERE id = ?').get(leadId);
+      if (fresh && !fresh.notified) {
+        updateLead(leadId, { notified: 1 });
+        await safeNotifyOwner(fresh);
+        const plan = business ? business.plan : null;
+        if (plan && planAllows(plan, 'emailNotifications')) {
+          await safeSendLeadNotification(business || { name: 'the business' }, fresh);
+        }
+      }
+    } catch (err) {
+      console.error(`[${logTag}] Landline owner-alert failed:`, err.message || err);
+    }
+    return;
+  }
+
+  // Mobile / VoIP / unknown: text back as normal.
+  const leadId = createLead(From, callId);
+  const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
+  try {
+    await sendSMS(From, firstMessage);
+  } catch (smsErr) {
+    console.error(`[${logTag}] Failed to send initial SMS:`, smsErr.message || smsErr);
+  }
+  appendToConversation(leadId, 'assistant', firstMessage);
+  console.log(`[${logTag}] SMS sent to ${From}`);
 }
 
 // Updates the lead's urgency/type/summary for the dashboard. Does NOT send email.
@@ -123,17 +176,7 @@ router.post('/missed-call', twilioAuth, async (req, res) => {
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
         .run(callId, From, To, CallSid, 'missed');
 
-      const leadId = createLead(From, callId);
-      const bizName = business ? business.name : 'us';
-      const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
-
-      try {
-        await sendSMS(From, firstMessage);
-      } catch (smsErr) {
-        console.error('[missed-call] Failed to send initial SMS:', smsErr.message || smsErr);
-      }
-      appendToConversation(leadId, 'assistant', firstMessage);
-      console.log(`SMS sent to ${From}`);
+      await handleMissedCallTextBack(From, callId, business, 'missed-call');
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
     }
@@ -153,17 +196,7 @@ router.post('/missed-call-fallback', twilioAuth, async (req, res) => {
       db.prepare(`INSERT INTO calls (id, from_number, to_number, call_sid, status) VALUES (?,?,?,?,?)`)
         .run(callId, From, To, CallSid, 'missed');
 
-      const leadId = createLead(From, callId);
-      const bizName = business ? business.name : 'us';
-      const firstMessage = `Hi! You just called ${bizName} and we missed you. We are sorry about that! How can we help you today?`;
-
-      try {
-        await sendSMS(From, firstMessage);
-      } catch (smsErr) {
-        console.error('[missed-call-fallback] Failed to send initial SMS:', smsErr.message || smsErr);
-      }
-      appendToConversation(leadId, 'assistant', firstMessage);
-      console.log(`SMS sent to ${From} after forwarding failed`);
+      await handleMissedCallTextBack(From, callId, business, 'missed-call-fallback');
     } catch (err) {
       console.log(`Duplicate or error: ${err.message}`);
     }
