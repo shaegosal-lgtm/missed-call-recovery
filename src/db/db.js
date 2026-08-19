@@ -112,4 +112,8 @@ ensureColumn('appointments', 'manual_customer_name', 'TEXT');
 ensureColumn('appointments', 'manual_customer_phone', 'TEXT');
 ensureColumn('appointments', 'manual_address', 'TEXT');
 ensureColumn('appointments', 'is_manual', 'INTEGER DEFAULT 0');
+ensureColumn('businesses', 'google_access_token', 'TEXT');
+ensureColumn('businesses', 'google_refresh_token', 'TEXT');
+ensureColumn('businesses', 'google_token_expiry', 'INTEGER');
+ensureColumn('businesses', 'google_calendar_connected', 'INTEGER DEFAULT 0');
 module.exports = db;

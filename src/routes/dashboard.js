@@ -13,6 +13,7 @@ const {
 const { sendSMS } = require('../services/twilioService');
 const { planAllows } = require('../config/plans');
 const calendarService = require('../services/calendarService');
+const googleCalendar = require('../services/googleCalendarService');
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.role === 'admin') return next();
@@ -1651,5 +1652,40 @@ router.post('/api/business/:id/calendar/delete/:apptId', requireAuth, (req, res)
   res.json(result);
 });
 // ===== END CALENDAR ROUTES =====
+
+// ===== GOOGLE CALENDAR CONNECT ROUTES =====
+router.get('/business/:id/google/connect', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.redirect('/dashboard');
+  }
+  if (!googleCalendar.isConfigured()) {
+    return res.send('Google Calendar is not configured on the server yet.');
+  }
+  res.redirect(googleCalendar.getAuthUrl(req.params.id));
+});
+
+router.get('/google/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const businessId = state;
+  if (error || !code) {
+    return res.redirect('/dashboard/business/' + (businessId || '') + '?calendar=denied');
+  }
+  try {
+    await googleCalendar.handleCallback(code, businessId);
+    return res.redirect('/dashboard/business/' + businessId + '?calendar=connected');
+  } catch (err) {
+    console.error('[google/callback] Failed:', err.message || err);
+    return res.redirect('/dashboard/business/' + businessId + '?calendar=error');
+  }
+});
+
+router.post('/business/:id/google/disconnect', requireAuth, (req, res) => {
+  if (req.session.role === 'business' && req.session.businessId !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  googleCalendar.disconnect(req.params.id);
+  res.json({ success: true });
+});
+// ===== END GOOGLE CALENDAR CONNECT ROUTES =====
 
 module.exports = router;
