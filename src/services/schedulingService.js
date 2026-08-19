@@ -1,5 +1,6 @@
 const db = require('../db/db');
 const { v4: uuidv4 } = require('uuid');
+const googleCalendar = require('./googleCalendarService');
 
 function getLocalHour(date, timezone) {
   try {
@@ -14,7 +15,10 @@ function getLocalHour(date, timezone) {
   }
 }
 
-function getAvailableSlots(businessId, date) {
+// NOTE: now async, because it optionally reads the business's connected Google
+// Calendar to also block times that are busy there (prevents double-booking
+// against events that live only in the owner's Google Calendar).
+async function getAvailableSlots(businessId, date) {
   const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(businessId);
   if (!business) throw new Error('Business not found');
 
@@ -78,13 +82,27 @@ function getAvailableSlots(businessId, date) {
     AND date(start_time) = ?
   `).all(businessId, date);
 
-  const unavailable = [...bookedSlots, ...blockedSlots];
+  // Google Calendar busy times (only if the business connected their calendar).
+  // Fail-open: if Google is unreachable, we just skip it rather than break booking.
+  let googleBusy = [];
+  try {
+    if (business.google_calendar_connected) {
+      const dayStart = new Date(date + 'T00:00:00Z');
+      const dayEnd = new Date(date + 'T23:59:59Z');
+      const busy = await googleCalendar.getBusyTimes(business, dayStart, dayEnd);
+      googleBusy = busy.map(b => ({ start_time: b.start.toISOString(), end_time: b.end.toISOString() }));
+    }
+  } catch (err) {
+    console.error('[getAvailableSlots] Google busy-times lookup failed, ignoring:', err.message || err);
+  }
+
+  const unavailable = [...bookedSlots, ...blockedSlots, ...googleBusy];
 
   return slots.filter(slot => {
     // Filter out slots in the past
     if (slot.start <= now) return false;
 
-    // Filter out booked/blocked slots
+    // Filter out booked/blocked/google-busy slots
     return !unavailable.some(u => {
       const uStart = new Date(u.start_time);
       const uEnd = new Date(u.end_time);
@@ -93,7 +111,8 @@ function getAvailableSlots(businessId, date) {
   });
 }
 
-function getNextAvailableDays(businessId, daysAhead = 7) {
+// Now async because getAvailableSlots is async.
+async function getNextAvailableDays(businessId, daysAhead = 7) {
   const results = [];
   const today = new Date();
 
@@ -101,7 +120,7 @@ function getNextAvailableDays(businessId, daysAhead = 7) {
     const date = new Date(today);
     date.setDate(today.getDate() + i);
     const dateStr = date.toISOString().split('T')[0];
-    const slots = getAvailableSlots(businessId, dateStr);
+    const slots = await getAvailableSlots(businessId, dateStr);
     if (slots.length > 0) {
       results.push({ date: dateStr, slots });
     }

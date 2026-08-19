@@ -241,20 +241,20 @@ function setServiceAddress(appointmentId, address) {
   }
 }
 
-function executeToolCall(toolName, toolInput, context) {
+async function executeToolCall(toolName, toolInput, context) {
   const { business, lead, From } = context;
   let result;
 
   if (toolName === 'check_availability') {
     const { date, time_of_day } = toolInput;
-    let slots = getAvailableSlots(business.id, date);
+      let slots = await getAvailableSlots(business.id, date);
 
     if (time_of_day === 'morning') slots = slots.filter(s => s.slotHour < 12);
     else if (time_of_day === 'afternoon') slots = slots.filter(s => s.slotHour >= 12 && s.slotHour < 17);
     else if (time_of_day === 'evening') slots = slots.filter(s => s.slotHour >= 17);
 
     if (slots.length === 0) {
-      const available = getNextAvailableDays(business.id, 14);
+            const available = await getNextAvailableDays(business.id, 14);
       if (available.length === 0) {
         result = { available: false, message: 'No availability in the next two weeks.' };
       } else {
@@ -485,7 +485,7 @@ Respond naturally. Use tools whenever you need real information or need to take 
 
     const toolResults = [];
     for (const toolUse of toolUseBlocks) {
-      const result = executeToolCall(toolUse.name, toolUse.input, { business, lead, From });
+            const result = await executeToolCall(toolUse.name, toolUse.input, { business, lead, From });
 
       if (toolUse.name === 'check_availability') {
         verifiedFacts.lastCheckAvailabilityDate = toolUse.input.date;
