@@ -2,13 +2,13 @@ const { google } = require('googleapis');
 const db = require('../db/db');
 
 // ---------------------------------------------------------------------------
-// Google Calendar sync service.
-// Lets a business connect their Google Calendar so the AI reads their real
-// busy times and never books over an existing event.
+// Google Calendar sync service (v2 - more robust token handling).
+// Reads a business's Google Calendar busy times so the AI never books over
+// an existing event.
 //
-// Requires env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
-// Tokens are stored per-business in the businesses table (added via migration):
-//   google_access_token, google_refresh_token, google_token_expiry, google_calendar_connected
+// Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
+// Per-business columns: google_access_token, google_refresh_token,
+//   google_token_expiry, google_calendar_connected
 // ---------------------------------------------------------------------------
 
 const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
@@ -25,41 +25,51 @@ function makeOAuthClient() {
   );
 }
 
-// Build the URL we send a business owner to, so they grant calendar access.
-// We pack the businessId into "state" so the callback knows who connected.
 function getAuthUrl(businessId) {
   const oauth2 = makeOAuthClient();
   return oauth2.generateAuthUrl({
-    access_type: 'offline',      // gets us a refresh token
-    prompt: 'consent',           // ensures a refresh token is returned every time
+    access_type: 'offline',
+    prompt: 'consent',           // force a fresh refresh token every time
     scope: SCOPES,
     state: businessId,
   });
 }
 
-// After the owner grants access, Google redirects back with a code.
-// Exchange it for tokens and store them on the business.
+// Exchange the code for tokens and store them. If Google returns a refresh
+// token, we OVERWRITE the stored one (a fresh consent always issues a new
+// refresh token; keeping a stale one causes invalid_grant).
 async function handleCallback(code, businessId) {
   const oauth2 = makeOAuthClient();
   const { tokens } = await oauth2.getToken(code);
 
   const accessToken = tokens.access_token || null;
-  const refreshToken = tokens.refresh_token || null;
-  const expiry = tokens.expiry_date || null; // ms timestamp
+  const refreshToken = tokens.refresh_token || null; // may be null if Google withholds it
+  const expiry = tokens.expiry_date || null;
 
-  db.prepare(`
-    UPDATE businesses SET
-      google_access_token = ?,
-      google_refresh_token = COALESCE(?, google_refresh_token),
-      google_token_expiry = ?,
-      google_calendar_connected = 1
-    WHERE id = ?
-  `).run(accessToken, refreshToken, expiry, businessId);
+  if (refreshToken) {
+    // Got a fresh refresh token — overwrite everything cleanly.
+    db.prepare(`
+      UPDATE businesses SET
+        google_access_token = ?,
+        google_refresh_token = ?,
+        google_token_expiry = ?,
+        google_calendar_connected = 1
+      WHERE id = ?
+    `).run(accessToken, refreshToken, expiry, businessId);
+  } else {
+    // No new refresh token returned — keep the existing one but update access token.
+    db.prepare(`
+      UPDATE businesses SET
+        google_access_token = ?,
+        google_token_expiry = ?,
+        google_calendar_connected = 1
+      WHERE id = ?
+    `).run(accessToken, expiry, businessId);
+  }
 
-  return { success: true };
+  return { success: true, gotRefreshToken: !!refreshToken };
 }
 
-// Disconnect a business's Google Calendar.
 function disconnect(businessId) {
   db.prepare(`
     UPDATE businesses SET
@@ -72,9 +82,10 @@ function disconnect(businessId) {
   return { success: true };
 }
 
-// Get an authorized client for a business, refreshing the access token if needed.
-// Returns null if the business hasn't connected or refresh fails.
-async function getAuthorizedClient(business) {
+// Build an authorized client. Sets whatever credentials we have and lets the
+// googleapis library handle refreshing automatically via the refresh token.
+// Persists any newly-refreshed access token back to the DB via the 'tokens' event.
+function buildClient(business) {
   if (!business || !business.google_refresh_token) return null;
 
   const oauth2 = makeOAuthClient();
@@ -84,44 +95,46 @@ async function getAuthorizedClient(business) {
     expiry_date: business.google_token_expiry || undefined,
   });
 
-  // If the token is expired or close to it, refresh proactively.
-  const now = Date.now();
-  const expiry = business.google_token_expiry || 0;
-  if (!business.google_access_token || now >= expiry - 60000) {
+  // When the library refreshes the access token, save it.
+  oauth2.on('tokens', (tokens) => {
     try {
-      const { credentials } = await oauth2.refreshAccessToken();
-      oauth2.setCredentials(credentials);
-      // Persist the refreshed token.
-      db.prepare(`
-        UPDATE businesses SET
-          google_access_token = ?,
-          google_token_expiry = ?,
-          google_refresh_token = COALESCE(?, google_refresh_token)
-        WHERE id = ?
-      `).run(
-        credentials.access_token || null,
-        credentials.expiry_date || null,
-        credentials.refresh_token || null,
-        business.id
-      );
-    } catch (err) {
-      console.error(`[googleCalendar] Token refresh failed for business ${business.id}:`, err.message || err);
-      return null;
+      if (tokens.access_token) {
+        db.prepare(`
+          UPDATE businesses SET
+            google_access_token = ?,
+            google_token_expiry = COALESCE(?, google_token_expiry),
+            google_refresh_token = COALESCE(?, google_refresh_token)
+          WHERE id = ?
+        `).run(
+          tokens.access_token,
+          tokens.expiry_date || null,
+          tokens.refresh_token || null,
+          business.id
+        );
+      }
+    } catch (e) {
+      console.error('[googleCalendar] Failed to persist refreshed token:', e.message || e);
     }
-  }
+  });
 
   return oauth2;
 }
 
-// Return the busy time ranges from the business's Google Calendar between
-// two Date objects. Each item is { start: Date, end: Date }.
-// Returns [] if not connected or on any error (fail-open: better to allow
-// booking than to break the AI entirely).
+// Return busy time ranges from the business's Google Calendar between two Dates.
+// Fail-open: returns [] on any problem so the AI still works.
 async function getBusyTimes(business, fromDate, toDate) {
   try {
-    if (!business || !business.google_calendar_connected) return [];
-    const auth = await getAuthorizedClient(business);
+    if (!business || !business.google_calendar_connected || !business.google_refresh_token) return [];
+    const auth = buildClient(business);
     if (!auth) return [];
+
+    // Force a token refresh up front so we always send a valid access token.
+    try {
+      await auth.getAccessToken();
+    } catch (refreshErr) {
+      console.error(`[googleCalendar] getAccessToken failed for business ${business.id}:`, refreshErr.message || refreshErr);
+      return [];
+    }
 
     const calendar = google.calendar({ version: 'v3', auth });
     const res = await calendar.freebusy.query({
@@ -146,6 +159,5 @@ module.exports = {
   getAuthUrl,
   handleCallback,
   disconnect,
-  getAuthorizedClient,
   getBusyTimes,
 };
