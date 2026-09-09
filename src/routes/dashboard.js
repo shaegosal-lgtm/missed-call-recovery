@@ -1687,20 +1687,24 @@ router.post('/business/:id/google/disconnect', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 // ===== END GOOGLE CALENDAR CONNECT ROUTES =====
-// ===== TEMP DIAGNOSTIC — remove later =====
-router.get('/google/status/:id', requireAdmin, (req, res) => {
-  const b = db.prepare('SELECT google_calendar_connected, google_access_token, google_refresh_token, google_token_expiry FROM businesses WHERE id = ?').get(req.params.id);
-  if (!b) return res.json({ error: 'business not found' });
-  res.json({
-    connected_flag: b.google_calendar_connected,
-    has_access_token: !!b.google_access_token,
-    has_refresh_token: !!b.google_refresh_token,
-    token_expiry: b.google_token_expiry,
-    expiry_readable: b.google_token_expiry ? new Date(b.google_token_expiry).toISOString() : null,
-    now: new Date().toISOString()
-  });
+// ===== TEMP DIAGNOSTIC 2 — check schedulingService has google code =====
+router.get('/google/checkcode', requireAdmin, (req, res) => {
+  const fs = require('fs');
+  const path = require('path');
+  try {
+    const schedContent = fs.readFileSync(path.join(__dirname, '../services/schedulingService.js'), 'utf8');
+    res.json({
+      scheduling_mentions_google: schedContent.includes('googleCalendar'),
+      scheduling_mentions_getBusyTimes: schedContent.includes('getBusyTimes'),
+      getAvailableSlots_is_async: schedContent.includes('async function getAvailableSlots'),
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
 });
-// ===== END TEMP DIAGNOSTIC =====
+// ===== END DIAGNOSTIC 2 =====
 
 module.exports = router;
+
+
 
