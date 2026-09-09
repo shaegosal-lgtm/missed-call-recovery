@@ -1687,5 +1687,20 @@ router.post('/business/:id/google/disconnect', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 // ===== END GOOGLE CALENDAR CONNECT ROUTES =====
+// ===== TEMP DIAGNOSTIC — remove later =====
+router.get('/google/status/:id', requireAdmin, (req, res) => {
+  const b = db.prepare('SELECT google_calendar_connected, google_access_token, google_refresh_token, google_token_expiry FROM businesses WHERE id = ?').get(req.params.id);
+  if (!b) return res.json({ error: 'business not found' });
+  res.json({
+    connected_flag: b.google_calendar_connected,
+    has_access_token: !!b.google_access_token,
+    has_refresh_token: !!b.google_refresh_token,
+    token_expiry: b.google_token_expiry,
+    expiry_readable: b.google_token_expiry ? new Date(b.google_token_expiry).toISOString() : null,
+    now: new Date().toISOString()
+  });
+});
+// ===== END TEMP DIAGNOSTIC =====
 
 module.exports = router;
+
